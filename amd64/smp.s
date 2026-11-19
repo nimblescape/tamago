@@ -195,7 +195,8 @@ wait:
 TEXT ·settls(SB),NOSPLIT,$0
 	ADDQ	$8, DI	// ELF wants to use -8(FS)
 	MOVQ	DI, AX
+	MOVQ	DI, DX
+	SHRQ	$32, DX	// WRMSR writes EDX:EAX, so EDX holds the high 32 bits
 	MOVQ	$MSR_FS_BASE, CX
-	MOVQ	$0x0, DX
 	WRMSR
 	RET
