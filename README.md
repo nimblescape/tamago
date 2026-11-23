@@ -292,12 +292,17 @@ Build tags
 The following build tags allow applications to override the package own
 definition for the `internal/runtime/goospkg` overlay:
 
-* `linkramstart`: override `ramStart`
-* `linkramsize`: override `ramSize`
-* `linkprintk`: override `printk`
+* `linkramstart`: override `goos.RamStart`
+* `linkramsize`: override `goos.RamSize`
+* `linkprintk`: override `goos.Printk`
 * `linkcpuinit`: override `cpuinit`
+* `linkhwinit0`: override `goos.Hwinit0`
 * `tiny`: reduce heap allocation requirements
 * `shared_stack`: increase system stack for OS/Monitor/Hypervisor use
+
+The following build tags are `GOARCH=arm64` specific:
+
+* `el1secure`: drop to EL1 Secure state when started as EL3
 
 Executing and debugging
 =======================

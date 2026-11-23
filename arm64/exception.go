@@ -20,18 +20,43 @@ import (
 const (
 	vecTableLoad = 0x58000052 // ldr x18, #8
 	vecTableJump = 0xd61f0240 // br x18
+	vecTableSub  = 0xd10043ff // sub sp, sp, #16
+	vecTableSave = 0xf90003f2 // str x18, [sp]
+
+	// lower EL trampoline handler address offset
+	lowerJumpTarget = 16
+)
+
+// Exception classes
+// (D12.2.36 ARM Architecture Reference Manual ARMv8).
+const (
+	ESR_EC     = 26
+	EC_UNKNOWN = 0b000000
+	EC_SVC64   = 0b010101
+	EC_SYSREG  = 0b011000
+	EC_SERROR  = 0b101111
 )
 
 // defined in exception.s
 func set_vbar(addr uint64)
 func read_el() uint64
 func read_elr() uintptr
+func read_esr() uint64
 func handleException()
 func handleInterrupt()
+func handleLowerException()
+func handleLowerInterrupt()
 
-type exceptionHandler func()
+// ExceptionHandler represents an exception vector entry point, reached through
+// a trampoline which uses R18 to branch to it (its value at exception time is
+// therefore lost, except for lower EL handlers, see [SetLowerVectorTable]).
+//
+// The handler must be an assembly function marked NOSPLIT|NOFRAME, as its
+// address is taken from the function value (i.e. its ABI wrapper). Fatal
+// exceptions can be handled in Go by overriding [SystemExceptionHandler].
+type ExceptionHandler func()
 
-func (fn exceptionHandler) vector() uint64 {
+func (fn ExceptionHandler) vector() uint64 {
 	return **((**uint64)(unsafe.Pointer(&fn)))
 }
 
@@ -46,34 +71,55 @@ func DefaultExceptionHandler() {
 
 	isThrowing = true
 
-	print("EL", int(read_el()&0b1100)>>2, " exception\n")
+	el := (read_el() >> 2) & 0b11
+	ec := (read_esr() >> ESR_EC) & 0b111111
+
+	print("EL", int(el), " exception class ", int(ec), "\n")
 	exception.Throw(read_elr())
 }
 
 // SystemExceptionHandler allows to override the default exception handler.
+//
+// The handler executes on the stack and goroutine (g) of the interrupted code,
+// with interrupts masked, and must not return. It should avoid allocations,
+// locks or any runtime state which might be inconsistent at exception time.
 var SystemExceptionHandler = DefaultExceptionHandler
 
-func addJump(addr uint64, fn exceptionHandler) {
+func systemException(pc uintptr) {
+	SystemExceptionHandler(pc)
+}
+
+func addJump(addr uint64, fn ExceptionHandler) {
 	reg.Write64(addr, vecTableLoad)
 	reg.Write64(addr+4, vecTableJump)
 	reg.Write64(addr+8, fn.vector())
 }
 
-func addJumps(addr uint64) {
+func addLowerJump(addr uint64, fn ExceptionHandler) {
+	reg.Write64As32(addr, vecTableSub)
+	reg.Write64As32(addr+4, vecTableSave)
+	addJump(addr+8, fn)
+}
+
+func setLowerJump(addr uint64, fn ExceptionHandler) {
+	reg.Write64(addr+lowerJumpTarget, fn.vector())
+}
+
+func addJumps(addr uint64, jump func(uint64, ExceptionHandler), syncHandler, irqHandler ExceptionHandler) {
 	// Synchronous Exception
-	addJump(addr, handleException)
+	jump(addr, syncHandler)
 
 	// IRQ or vIRQ
 	addr += 0x80
-	addJump(addr, handleInterrupt)
+	jump(addr, irqHandler)
 
 	// FIQ or vFIQ
 	addr += 0x80
-	addJump(addr, handleInterrupt)
+	jump(addr, irqHandler)
 
 	// SError or vSError
 	addr += 0x80
-	addJump(addr, handleException)
+	jump(addr, syncHandler)
 }
 
 //go:nosplit
@@ -84,16 +130,30 @@ func (cpu *CPU) initVectorTable() {
 	// initialize jump tables
 	// Table D1-7 ARM Architecture Reference Manual ARMv8
 
-	// EL0
-	addJumps(vectorTable)
-	// ELx, x>0
-	addJumps(vectorTable + 0x200)
+	// current EL with SP_EL0
+	addJumps(vectorTable, addJump, handleException, handleInterrupt)
+	// current with ELx, x>0
+	addJumps(vectorTable+0x200, addJump, handleException, handleInterrupt)
+	// Lower EL, AArch64
+	addJumps(vectorTable+0x400, addLowerJump, handleLowerException, handleLowerInterrupt)
 
 	// set vector base address register
 	set_vbar(vectorTable)
 }
 
+// SetLowerVectorTable updates the CPU exception handling vector table, for
+// lower exception levels.
+//
+// Unlike other vector table entries, the interrupted context R18 value is
+// preserved: on handler entry the stack pointer is decremented by 16 and R18
+// is stored at its address. The handler is responsible for restoring the
+// stack pointer (e.g. by adding 16 after retrieving R18).
+func (cpu *CPU) SetLowerVectorTable(syncHandler, irqHandler ExceptionHandler) {
+	vectorTable := uint64(goos.RamStart)
+	addJumps(vectorTable+0x400, setLowerJump, syncHandler, irqHandler)
+}
+
 // CurrentEL returns the Current Exception Level.
 func (cpu *CPU) CurrentEL() int {
-	return int(read_el()&0b1100) >> 2
+	return int((read_el() >> 2) & 0b11)
 }

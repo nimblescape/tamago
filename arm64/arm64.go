@@ -36,6 +36,8 @@ type CPU struct {
 	mmu *mmu
 }
 
+var m mmu
+
 // defined in arm64.s
 func exit(int32)
 

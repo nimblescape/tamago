@@ -14,6 +14,17 @@ TEXT ·handleException(SB),NOSPLIT|NOFRAME,$0
 	MOVD	R0, 8(RSP)
 	CALL	internal∕runtime∕goospkg·SystemStack(SB)
 
+// Lower EL trampolines (see addLowerJump) push the interrupted R18 value,
+// default handlers discard it.
+
+TEXT ·handleLowerException(SB),NOSPLIT|NOFRAME,$0
+	ADD	$16, RSP
+	JMP	·handleException(SB)
+
+TEXT ·handleLowerInterrupt(SB),NOSPLIT|NOFRAME,$0
+	ADD	$16, RSP
+	JMP	·handleInterrupt(SB)
+
 // func set_vbar(addr uint64)
 TEXT ·set_vbar(SB),NOSPLIT,$0
 	MOVD	addr+0(FP), R0
@@ -29,5 +40,11 @@ TEXT ·read_el(SB),$0-8
 // func read_elr() uintptr
 TEXT ·read_elr(SB),$0-8
 	MRS	ELR_EL1, R0
+	MOVD	R0, ret+0(FP)
+	RET
+
+// func read_esr() uint64
+TEXT ·read_esr(SB),$0-8
+	MRS	ESR_EL1, R0
 	MOVD	R0, ret+0(FP)
 	RET

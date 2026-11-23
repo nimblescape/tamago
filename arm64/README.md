@@ -56,6 +56,8 @@ definition for the `internal/runtime/goospkg` overlay:
 
 * `linkramstart`: exclude `ramStart` from `mem.go`
 * `linkcpuinit`: exclude `cpuinit` from `init.s`
+* `linkhwinit0`: exclude `Init` from `init.go`
+* `el1secure`: drop to EL1 Secure state when started as EL3
 
 License
 =======
