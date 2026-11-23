@@ -296,7 +296,7 @@ definition for the `internal/runtime/goospkg` overlay:
 * `linkramsize`: override `goos.RamSize`
 * `linkprintk`: override `goos.Printk`
 * `linkcpuinit`: override `cpuinit`
-* `linkhwinit0`: override `goos.Hwinit0`
+* `linkhwinit0`: override `goos.InitHW0`
 * `tiny`: reduce heap allocation requirements
 * `shared_stack`: increase system stack for OS/Monitor/Hypervisor use
 

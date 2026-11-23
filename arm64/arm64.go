@@ -51,7 +51,7 @@ func (cpu *CPU) DefaultIdleGovernor(pollUntil int64) {
 
 // Init performs initialization of an ARM64 core instance.
 func (cpu *CPU) Init() {
-	// MMU initialization already performed at runtime/goos.Hwinit0
+	// MMU initialization already performed at runtime/goos.InitHW0
 	cpu.mmu = &m
 
 	goos.Exit = exit
