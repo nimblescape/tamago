@@ -86,22 +86,16 @@ const (
 // defined in smp.s
 func apinit_reloc(init uintptr, start uintptr)
 
-// apTLS holds the thread-local storage (TLS) block of each slot. The AP of
-// the slot points its FS base at the block, and the runtime keeps the
-// current goroutine (g) there, as it keeps the g of the BSP in m0.tls. An M
-// never leaves its AP, so the block of the slot serves its M.
-var apTLS [maxAPs]uint64
-
 // task represents a CPU task
 type task struct {
 	sp uint64 // stack pointer
-	gp uint64 // G
+	mp uint64 // M
 	pc uint64 // fn
 }
 
 const (
 	taskSP = taskAddress + uint64(unsafe.Offsetof(task{}.sp))
-	taskGP = taskAddress + uint64(unsafe.Offsetof(task{}.gp))
+	taskMP = taskAddress + uint64(unsafe.Offsetof(task{}.mp))
 	taskPC = taskAddress + uint64(unsafe.Offsetof(task{}.pc))
 )
 
@@ -111,11 +105,14 @@ const (
 // On `GOOS=tamago` Go scheduler M's are never dropped, therefore the function
 // is invoked only once per AP (i.e. GOMAXPROCS-1).
 //
+// The AP enters fn on the stack sp with mp in R13, as the child of clone
+// on Linux enters it: fn sets up the TLS block and the g of the M itself.
+//
 // The runtime may call Task on several processors at once, and all APs
 // share one task structure. So Task holds a lock and returns only when
 // the AP has taken the task.
-func (cpu *CPU) Task(sp, _, gp, fn unsafe.Pointer) {
-	if sp == nil || gp == nil {
+func (cpu *CPU) Task(sp, mp, _, fn unsafe.Pointer) {
+	if sp == nil || mp == nil {
 		return
 	}
 
@@ -138,7 +135,7 @@ func (cpu *CPU) Task(sp, _, gp, fn unsafe.Pointer) {
 
 	// the AP reads pc first, therefore pc is written last
 	reg.Write64(taskSP, uint64(uintptr(sp)))
-	reg.Write64(taskGP, uint64(uintptr(gp)))
+	reg.Write64(taskMP, uint64(uintptr(mp)))
 	reg.Write64(taskPC, uint64(uintptr(fn)))
 
 	// Signal the task through NMI until the AP clears pc: an NMI that
@@ -338,7 +335,7 @@ func (cpu *CPU) prepareAPs() {
 
 	// reset SMP semaphore/task
 	reg.Write64(taskSP, 0)
-	reg.Write64(taskGP, 0)
+	reg.Write64(taskMP, 0)
 	reg.Write64(taskPC, 0)
 
 	// read fresh CR3 as a cpuinit override might have overridden ours,

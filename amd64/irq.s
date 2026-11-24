@@ -31,6 +31,10 @@ reuse:
 	MOVQ	16(BX), CX
 	MOVQ	CX, 16(AX)
 
+	// save GDT register for APs, which load the GDT of the BSP
+	MOVQ	$·gdtptr(SB), CX
+	SGDT	(CX)
+
 	// load IDT register
 	SUBQ	$16, SP
 	SIDT	(SP)

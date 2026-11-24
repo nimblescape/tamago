@@ -197,11 +197,6 @@ x2apic:
 	ORL	$(1<<const_apicBaseX2APIC), AX
 	WRMSR
 ready:
-	// point the FS base at the TLS block of the slot (see apTLS)
-	LEAQ	·apTLS(SB), DI
-	LEAQ	(DI)(R13*8), DI
-	CALL	·settls(SB)
-
 	// write the APIC ID into the slot of the table, which tells that
 	// this AP is ready, unless the package does not support the APIC ID
 	LAPIC_ID_AX
@@ -236,11 +231,11 @@ wait:
 	JE	wait
 
 	MOVQ	task_sp(AX), SP
-	MOVQ	task_gp(AX), g
+	MOVQ	task_mp(AX), R13
 
 	// clear task, pc last, as CPU.Task waits for it
 	MOVQ	$0, task_sp(AX)
-	MOVQ	$0, task_gp(AX)
+	MOVQ	$0, task_mp(AX)
 	MOVQ	$0, task_pc(AX)
 
 	// drop the address translations of the start code, which the caller
@@ -248,12 +243,7 @@ wait:
 	MOVQ	CR3, BX
 	MOVQ	BX, CR3
 
-	// keep g in the TLS block of the slot, where the runtime reads it
-	// The two-instruction form also builds with -buildmode=pie.
-	MOVQ	TLS, AX
-	MOVQ	g, 0(AX)(TLS*1)
-
-	// call task target
+	// call task target with the M in R13 (see CPU.Task)
 	STI
 	CALL	R12
 
@@ -265,12 +255,3 @@ park:
 	CLI
 	HLT
 	JMP	park
-
-TEXT ·settls(SB),NOSPLIT,$0
-	ADDQ	$8, DI	// ELF wants to use -8(FS)
-	MOVQ	DI, AX
-	MOVQ	DI, DX
-	SHRQ	$32, DX	// WRMSR writes EDX:EAX, so EDX holds the high 32 bits
-	MOVQ	$MSR_FS_BASE, CX
-	WRMSR
-	RET
