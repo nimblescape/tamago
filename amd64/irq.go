@@ -117,6 +117,13 @@ func setIDT(start int, end int) {
 		idtAddr, irqHandlerAddr = load_idt()
 	}
 
+	setGates(start, end, irqHandlerAddr)
+}
+
+// setGates points the IDT gates of the vectors from start to end at a table
+// of CALL instructions, in which the entry of vector i is at base plus i
+// times callSize.
+func setGates(start int, end int, base uintptr) {
 	desc := &GateDescriptor{
 		SegmentSelector: 1 << 3,
 		Attributes:      InterruptGate,
@@ -139,9 +146,7 @@ func setIDT(start int, end int) {
 			break
 		}
 
-		// set ISR to irqHandler.abi0 + vector offset
-		off := irqHandlerAddr + uintptr(i*callSize)
-		desc.SetOffset(off)
+		desc.SetOffset(base + uintptr(i*callSize))
 		copy(idt[i*gateSize:], desc.Bytes())
 	}
 }

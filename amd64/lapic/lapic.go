@@ -127,3 +127,17 @@ func (io *LAPIC) SetTimer(id int, mode int) {
 
 	reg.Write(io.Base+LAPIC_LVT_TIMER, val)
 }
+
+// MSI message (Intel® 64 and IA-32 Architectures Software Developer’s Manual
+// Volume 3A - 11.11 Message Signalled Interrupts)
+const (
+	MSI_ADDRESS = 0xfee00000
+	MSI_DEST    = 12
+)
+
+// MSI returns the message address and data of an MSI or MSI-X interrupt with
+// the argument vector to the processor with the argument APIC ID: fixed
+// delivery, edge triggered, physical destination mode.
+func MSI(apicid int, vector int) (addr uint64, data uint32) {
+	return MSI_ADDRESS | uint64(apicid&0xff)<<MSI_DEST, uint32(vector & 0xff)
+}

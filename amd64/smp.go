@@ -67,7 +67,9 @@ const (
 	maxAPs = 255
 
 	// startStackSize is the size of the start stack of a slot, which
-	// holds a return address and the frame of the NMI of [CPU.Task].
+	// holds a return address, the frame of an interrupt that the AP
+	// takes while it waits for its task (less than 100 bytes for an
+	// event vector) and the frame of the NMI of [CPU.Task].
 	startStackShift = 8
 	startStackSize  = 1 << startStackShift
 
@@ -234,6 +236,11 @@ func (cpu *CPU) InitSMP(n int) {
 // The table holds the 8-bit APIC IDs of the xAPIC, so StartAPs supports
 // systems whose APIC IDs fit 8 bits, with the LAPIC at [LAPIC_BASE] in
 // xAPIC mode. It returns an error and starts no AP on other systems.
+//
+// A ready AP takes interrupts while it waits for the runtime to start a
+// thread on it, so that a device may send interrupts to any AP that
+// StartAPs returns. The IDT, with its event vectors (see
+// [CPU.EnableEvents]), must be complete before the call.
 //
 // The caller maps the pages from 0x4000 to 0x6fff before the call. The
 // page at 0x4000 holds the 16-bit start code of the APs and must be

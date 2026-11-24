@@ -184,15 +184,25 @@ TEXT ·apstart<>(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	$(const_apicTableAddress), BX
 	MOVL	CX, (BX)(R13*4)
 
+	// enable LAPIC, so that the AP takes interrupts while it waits for
+	// its task: the event vectors of the devices may name it. Spurious
+	// interrupts take the vector of IRQ_WAKEUP, whose handler only
+	// records a wake-up, as on the BSP (see CPU.EnableEvents).
+	MOVL	$(const_LAPIC_SVR), AX
+	MOVL	$(1<<const_SVR_ENABLE | const_IRQ_WAKEUP), (AX)
+
 	// use taskAddress as counting semaphore for SMP enabling
 	MOVQ	$(const_taskAddress), BX
 	MOVL	$1, AX
 	LOCK
 	XADDL	AX, 0(BX)
 wait:
-	// wait NMI from CPU.Task
-	CLI
+	// wait for the NMI from CPU.Task, and serve interrupts on the start
+	// stack meanwhile: the instruction after STI runs before the first
+	// interrupt, so no interrupt passes HLT unseen
+	STI
 	HLT
+	CLI
 
 	MOVQ	$(const_taskAddress), AX
 	MOVQ	task_pc(AX), R12
@@ -217,10 +227,6 @@ wait:
 	// The two-instruction form also builds with -buildmode=pie.
 	MOVQ	TLS, AX
 	MOVQ	g, 0(AX)(TLS*1)
-
-	// enable LAPIC
-	MOVL	$(const_LAPIC_SVR), AX
-	MOVL	$(1<<const_SVR_ENABLE), (AX)	// set SVR_ENABLE
 
 	// call task target
 	STI
