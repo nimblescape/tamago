@@ -11,7 +11,7 @@
 #include "textflag.h"
 
 // NOTE: this offset needs adjustment in case of any changes to ·apinit
-#define doneOffset 0x72
+#define doneOffset 0x86
 #define doneMarker 0xcccccccccccccccc
 
 // func apinit_reloc(init uintptr, start uintptr)
@@ -65,6 +65,18 @@ TEXT ·apinit<>(SB),NOSPLIT|NOFRAME,$0
 	// apply BSP paging setup (see init.s)
 	MOVL	BX, CR3
 
+	// apply the page attributes (PAT) of the BSP, while the caches and
+	// paging are still off
+	DATA32
+	MOVL	$(const_patAddress), BX
+	DATA32; ADDR32
+	MOVL	(BX), AX
+	DATA32; ADDR32
+	MOVL	4(BX), DX
+	DATA32
+	MOVL	$MSR_PAT, CX
+	WRMSR
+
 	// The far return to Long Mode below pushes the same values on every
 	// AP, so all APs share this stack.
 	DATA32
@@ -88,9 +100,12 @@ TEXT ·apinit<>(SB),NOSPLIT|NOFRAME,$0
 	ORL	$(1<<8|1<<11), AX		// set MSR_EFER.(LME|NXE)
 	WRMSR
 
-	MOVL	CR0, AX
+	// INIT leaves CR0.CD and CR0.NW set: the caches are off, and the
+	// cache of the AP does not stay coherent with the other processors.
+	// So the whole register is written: caches on, and write protection
+	// in ring 0 (WP) and native FPU errors (NE) as on the BSP.
 	DATA32
-	ORL	$(1<<31 | 1<<1 |1<<0), AX	// set CR0.(PG|MP|PE)
+	MOVL	$(1<<31 | 1<<16 | 1<<5 | 1<<4 | 1<<1 | 1<<0), AX // CR0.(PG|WP|NE|ET|MP|PE)
 	MOVL	AX, CR0
 
 	// set Global Descriptor Table

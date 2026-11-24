@@ -9,6 +9,7 @@
 package amd64
 
 import (
+	"errors"
 	"runtime"
 	"runtime/goos"
 	"time"
@@ -46,6 +47,10 @@ const (
 
 	// stacksAddress holds the address of the start stacks of the slots
 	stacksAddress = 0x6048
+
+	// patAddress holds the page attributes (PAT) of the BSP, which each
+	// AP applies
+	patAddress = 0x6050
 
 	// The far return to Long Mode in ·apinit pushes the same values on
 	// every AP, so all APs share the stack that ends here.
@@ -221,20 +226,25 @@ func (cpu *CPU) InitSMP(n int) {
 
 // StartAPs starts every Application Processor (AP) of a bare metal system
 // whose APIC IDs need not be consecutive and which has no firmware table
-// that names them. It sends one broadcast of the INIT and Startup IPIs to
+// that names them. It sends the INIT IPI and twice the Startup IPI to
 // all processors but the BSP. Each AP writes its APIC ID into a table
 // when it is ready, and StartAPs returns the APIC IDs of the ready APs in
 // the order of their arrival. The runtime uses them after [CPU.UseAPs].
 //
 // The table holds the 8-bit APIC IDs of the xAPIC, so StartAPs supports
-// systems whose APIC IDs fit 8 bits.
+// systems whose APIC IDs fit 8 bits, with the LAPIC at [LAPIC_BASE] in
+// xAPIC mode. It returns an error and starts no AP on other systems.
 //
 // The caller maps the pages from 0x4000 to 0x6fff before the call. The
 // page at 0x4000 holds the 16-bit start code of the APs and must be
 // writable and executable during the call. The caller may unmap it and
 // the page at 0x5000 after the call. The page at 0x6000 must stay mapped
 // and writable while the runtime starts tasks on the APs.
-func (cpu *CPU) StartAPs() []int {
+func (cpu *CPU) StartAPs() ([]int, error) {
+	if err := cpu.checkXAPIC(); err != nil {
+		return nil, err
+	}
+
 	cpu.prepareAPs()
 
 	// AMD64 Architecture Programmer’s Manual
@@ -244,7 +254,12 @@ func (cpu *CPU) StartAPs() []int {
 	cpu.LAPIC.IPI(0, vector, 1<<lapic.ICR_INIT|lapic.ICR_DLV_INIT|lapic.ICR_DST_REST)
 	time.Sleep(10 * time.Millisecond)
 
-	cpu.LAPIC.IPI(0, vector, 1<<lapic.ICR_INIT|lapic.ICR_DLV_SIPI|lapic.ICR_DST_REST)
+	// The second Startup IPI starts an AP that missed the first one. An
+	// AP that has started ignores it.
+	for range 2 {
+		cpu.LAPIC.IPI(0, vector, 1<<lapic.ICR_INIT|lapic.ICR_DLV_SIPI|lapic.ICR_DST_REST)
+		time.Sleep(200 * time.Microsecond)
+	}
 
 	// wait until no new AP is ready for apSettle
 	ready := uint32(0)
@@ -269,7 +284,7 @@ func (cpu *CPU) StartAPs() []int {
 		}
 	}
 
-	return aps
+	return aps, nil
 }
 
 // UseAPs lets the runtime run on the BSP and on the APs with the APIC IDs
@@ -287,6 +302,35 @@ func (cpu *CPU) UseAPs(aps []int) {
 	goos.Wake = cpu.Wake
 
 	runtime.GOMAXPROCS(len(aps) + 1)
+}
+
+// The MSR of the page attributes and the MSR of the base address and the
+// mode of the LAPIC (AMD64 Architecture Programmer’s Manual, Volume 2 -
+// 16.3.1 Local APIC Enable).
+const (
+	msrPAT      = 0x277
+	msrAPICBase = 0x1b
+
+	apicBaseEnable = 1 << 11
+	apicBaseX2APIC = 1 << 10
+	apicBaseMask   = 0x000ffffffffff000
+)
+
+// checkXAPIC returns an error unless the LAPIC is enabled in xAPIC mode
+// at [LAPIC_BASE], which the start of the APs needs.
+func (cpu *CPU) checkXAPIC() error {
+	base := cpu.MSR(msrAPICBase)
+
+	switch {
+	case base&apicBaseEnable == 0:
+		return errors.New("the LAPIC is disabled")
+	case base&apicBaseX2APIC != 0:
+		return errors.New("the LAPIC is in x2APIC mode, and the start of the APs supports only the xAPIC mode")
+	case base&apicBaseMask != LAPIC_BASE:
+		return errors.New("the LAPIC is not at its default address")
+	}
+
+	return nil
 }
 
 // prepareAPs writes the start code of the APs and its data into the pages
@@ -319,6 +363,7 @@ func (cpu *CPU) prepareAPs() {
 	}
 
 	reg.Write(cr3Address, uint32(cr3))
+	reg.Write64(patAddress, cpu.MSR(msrPAT))
 
 	// the slots and their start stacks
 	if cpu.apStacks == nil {
