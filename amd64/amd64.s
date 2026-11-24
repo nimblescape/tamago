@@ -10,9 +10,16 @@
 #include "textflag.h"
 
 // Global Descriptor Table
+//
+// The accessed bit is set in each descriptor. A processor that loads a
+// segment whose descriptor has the bit clear writes the bit into the table,
+// also when it loads CS for an interrupt. The table lies in read-only data,
+// which a program may map read-only: the write would then fault during the
+// delivery of every interrupt, and the processor would reset (triple
+// fault). The APs load this table (see ·apstart).
 DATA	·gdt+0x00(SB)/8, $0x0000000000000000	// null descriptor
-DATA	·gdt+0x08(SB)/8, $0x00209a0000000000	// code descriptor (x/r)
-DATA	·gdt+0x10(SB)/8, $0x0000920000000000	// data descriptor (r/w)
+DATA	·gdt+0x08(SB)/8, $0x00209b0000000000	// code descriptor (x/r, accessed)
+DATA	·gdt+0x10(SB)/8, $0x0000930000000000	// data descriptor (r/w, accessed)
 GLOBL	·gdt(SB),RODATA,$(3*8)
 
 // Global Descriptor Table Register

@@ -320,10 +320,11 @@ func (cpu *CPU) prepareAPs() {
 	// copy ·apstart pointer to avoid RIP/EIP-relative addressing
 	apinit_reloc(apinitAddress, apstartAddress)
 
-	// create AP Global Descriptor Table (GDT)
+	// create AP Global Descriptor Table (GDT), with the accessed bit set
+	// as in ·gdt (see amd64.s)
 	reg.Write64(gdtAddress+0x00, 0x0000000000000000) // null descriptor
-	reg.Write64(gdtAddress+0x08, 0x00af9a000000ffff) // code descriptor (x/r, 64-bit)
-	reg.Write64(gdtAddress+0x10, 0x00cf92000000ffff) // data descriptor (r/w, flat)
+	reg.Write64(gdtAddress+0x08, 0x00af9b000000ffff) // code descriptor (x/r, 64-bit, accessed)
+	reg.Write64(gdtAddress+0x10, 0x00cf93000000ffff) // data descriptor (r/w, flat, accessed)
 
 	// create AP GDT Descriptor (GDTR)
 	reg.Write16(gdtrAddress+0x00, 3*8-1)      // GTD Limit
