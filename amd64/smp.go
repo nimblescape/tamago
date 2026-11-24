@@ -9,18 +9,18 @@
 package amd64
 
 import (
-	"bytes"
-	"encoding/binary"
 	"runtime"
 	"runtime/goos"
 	"time"
 	"unsafe"
 
 	"github.com/usbarmory/tamago/amd64/lapic"
-	"github.com/usbarmory/tamago/dma"
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
+// The start code and the start data of the APs lie in the pages from
+// 0x4000 to 0x6fff, below 1 MiB, because an AP starts in 16-bit Real
+// Mode.
 const (
 	// ·apinit 16-bit relocation address
 	apinitAddress = 0x4000
@@ -32,11 +32,50 @@ const (
 	// AP GDT Descriptor (GDTR) 16-bit address
 	gdtrAddress = 0x6018
 
-	// AP task address
+	// AP task address (see task), its first word counts the APs that are
+	// ready before the first task
 	taskAddress = 0x6020
 
-	// CR3 value address
-	cr3Address = 0x6028
+	// CR3 value address, 32 bits
+	cr3Address = 0x6038
+
+	// slotAddress counts the APs that started. Each AP takes the next
+	// slot: it writes its APIC ID into the table at apicTableAddress
+	// and uses the start stack of the slot.
+	slotAddress = 0x6040
+
+	// stacksAddress holds the address of the start stacks of the slots
+	stacksAddress = 0x6048
+
+	// The far return to Long Mode in ·apinit pushes the same values on
+	// every AP, so all APs share the stack that ends here.
+	sharedStackAddress = 0x6100
+
+	// APIC ID table, one 32-bit word per slot, which holds noAPIC until
+	// the AP of the slot is ready
+	apicTableAddress = 0x6100
+	noAPIC           = 0xffffffff
+
+	// maxAPs is the number of slots, as an xAPIC addresses up to 255
+	// processors with its 8-bit APIC IDs. An AP without a slot stays
+	// halted.
+	maxAPs = 255
+
+	// startStackSize is the size of the start stack of a slot, which
+	// holds a return address and the frame of the NMI of [CPU.Task].
+	startStackShift = 8
+	startStackSize  = 1 << startStackShift
+
+	// apSettle is the time without a new AP after which
+	// [CPU.StartAPs] considers all APs started, apLimit the
+	// longest time that it waits for them and that [CPU.Task] waits
+	// until an AP takes its task.
+	apSettle = 100 * time.Millisecond
+	apLimit  = 1 * time.Second
+
+	// nmiInterval is the time after which [CPU.Task] sends the NMI
+	// again while the AP has not taken its task.
+	nmiInterval = time.Millisecond
 )
 
 // defined in smp.s
@@ -49,49 +88,64 @@ type task struct {
 	pc uint64 // fn
 }
 
-// Write writes the task structure to memory
-func (t *task) Write(addr uint) {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, t)
-
-	n := buf.Len()
-	r, err := dma.NewRegion(addr, n, false)
-
-	if err != nil {
-		panic(err)
-	}
-
-	_, p := r.Reserve(n, 0)
-	defer r.Release(addr)
-
-	copy(p, buf.Bytes())
-}
+const (
+	taskSP = taskAddress + uint64(unsafe.Offsetof(task{}.sp))
+	taskGP = taskAddress + uint64(unsafe.Offsetof(task{}.gp))
+	taskPC = taskAddress + uint64(unsafe.Offsetof(task{}.pc))
+)
 
 // Task schedules a goroutine on a previously initialized Application Processor
 // (see [CPU.InitSMP]).
 //
 // On `GOOS=tamago` Go scheduler M's are never dropped, therefore the function
 // is invoked only once per AP (i.e. GOMAXPROCS-1).
+//
+// The runtime may call Task on several processors at once, and all APs
+// share one task structure. So Task holds a lock and returns only when
+// the AP has taken the task.
 func (cpu *CPU) Task(sp, _, gp, fn unsafe.Pointer) {
-	t := &task{
-		sp: uint64(uintptr(sp)),
-		gp: uint64(uintptr(gp)),
-		pc: uint64(uintptr(fn)),
-	}
-
-	if t.sp == 0 || t.gp == 0 {
+	if sp == nil || gp == nil {
 		return
 	}
+
+	for !cpu.taskLock.CompareAndSwap(false, true) {
+	}
+	defer cpu.taskLock.Store(false)
 
 	if cpu.init+1 >= runtime.GOMAXPROCS(-1) {
 		panic("Task exceeds available resources")
 	}
 
-	t.Write(taskAddress)
+	// the APIC IDs of the APs are 1 to n-1, unless StartAPs found them
+	apicid := cpu.init + 1
 
-	// set last initialized CPU and signal task through NMI
+	if cpu.aps != nil {
+		apicid = cpu.aps[cpu.init]
+	}
+
 	cpu.init += 1
-	cpu.LAPIC.IPI(cpu.init, 0, lapic.ICR_DLV_NMI)
+
+	// the AP reads pc first, therefore pc is written last
+	reg.Write64(taskSP, uint64(uintptr(sp)))
+	reg.Write64(taskGP, uint64(uintptr(gp)))
+	reg.Write64(taskPC, uint64(uintptr(fn)))
+
+	// Signal the task through NMI until the AP clears pc: an NMI that
+	// arrives just before the AP halts does not wake it.
+	var sent int64
+
+	for start := cpu.GetTime(); reg.Read64(taskPC) != 0; {
+		now := cpu.GetTime()
+
+		if now-start > int64(apLimit) {
+			panic("AP does not take its task")
+		}
+
+		if sent == 0 || now-sent >= int64(nmiInterval) {
+			cpu.LAPIC.IPI(apicid, 0, lapic.ICR_DLV_NMI)
+			sent = now
+		}
+	}
 }
 
 // ID returns the processor identifier.
@@ -114,7 +168,7 @@ func (cpu *CPU) GOMAXPROCS(n int) int {
 	}
 
 	// wait for all APs to reach ·apstart idle state
-	if reg.WaitFor(1*time.Second, taskAddress, 0, 0xffffffff, uint32(n-1)) {
+	if reg.WaitFor(apLimit, taskAddress, 0, 0xffffffff, uint32(n-1)) {
 		goos.ProcID = cpu.ID
 		goos.Task = cpu.Task
 		goos.Wake = cpu.Wake
@@ -142,21 +196,7 @@ func (cpu *CPU) InitSMP(n int) {
 		return
 	}
 
-	// copy ·apinit to a 16-bit address reachable in real mode
-	// copy ·apstart pointer to avoid RIP/EIP-relative addressing
-	apinit_reloc(apinitAddress, apstartAddress)
-
-	// create AP Global Descriptor Table (GDT)
-	reg.Write64(gdtAddress+0x00, 0x0000000000000000) // null descriptor
-	reg.Write64(gdtAddress+0x08, 0x00209a00000fffff) // code descriptor (x/r)
-	reg.Write64(gdtAddress+0x10, 0x00009200000fffff) // data descriptor (r/w)
-
-	// create AP GDT Descriptor (GDTR)
-	reg.Write16(gdtrAddress+0x00, 3*8-1)      // GTD Limit
-	reg.Write32(gdtrAddress+0x02, gdtAddress) // GDT Base Address
-
-	// read fresh CR3 as a cpuinit override might have overridden ours
-	reg.Write(cr3Address, uint32(read_cr3()))
+	cpu.prepareAPs()
 
 	for i = 1; i < NumCPU(); i++ {
 		if i == n {
@@ -177,6 +217,120 @@ func (cpu *CPU) InitSMP(n int) {
 	}
 
 	cpu.GOMAXPROCS(i)
+}
+
+// StartAPs starts every Application Processor (AP) of a bare metal system
+// whose APIC IDs need not be consecutive and which has no firmware table
+// that names them. It sends one broadcast of the INIT and Startup IPIs to
+// all processors but the BSP. Each AP writes its APIC ID into a table
+// when it is ready, and StartAPs returns the APIC IDs of the ready APs in
+// the order of their arrival. The runtime uses them after [CPU.UseAPs].
+//
+// The table holds the 8-bit APIC IDs of the xAPIC, so StartAPs supports
+// systems whose APIC IDs fit 8 bits.
+//
+// The caller maps the pages from 0x4000 to 0x6fff before the call. The
+// page at 0x4000 holds the 16-bit start code of the APs and must be
+// writable and executable during the call. The caller may unmap it and
+// the page at 0x5000 after the call. The page at 0x6000 must stay mapped
+// and writable while the runtime starts tasks on the APs.
+func (cpu *CPU) StartAPs() []int {
+	cpu.prepareAPs()
+
+	// AMD64 Architecture Programmer’s Manual
+	// Volume 2 - 15.27.8 Secure Multiprocessor Initialization
+	vector := apinitAddress >> 12
+
+	cpu.LAPIC.IPI(0, vector, 1<<lapic.ICR_INIT|lapic.ICR_DLV_INIT|lapic.ICR_DST_REST)
+	time.Sleep(10 * time.Millisecond)
+
+	cpu.LAPIC.IPI(0, vector, 1<<lapic.ICR_INIT|lapic.ICR_DLV_SIPI|lapic.ICR_DST_REST)
+
+	// wait until no new AP is ready for apSettle
+	ready := uint32(0)
+	last := time.Now()
+
+	for start := last; time.Since(start) < apLimit && time.Since(last) < apSettle; {
+		if r := reg.Read(taskAddress); r != ready {
+			ready = r
+			last = time.Now()
+		}
+
+		runtime.Gosched()
+	}
+
+	// An AP writes its APIC ID into its slot when it is ready, so a
+	// slot without an APIC ID belongs to an AP that did not get ready.
+	var aps []int
+
+	for i := range min(reg.Read(slotAddress), maxAPs) {
+		if id := reg.Read(apicTableAddress + 4*i); id != noAPIC {
+			aps = append(aps, int(id))
+		}
+	}
+
+	return aps
+}
+
+// UseAPs lets the runtime run on the BSP and on the APs with the APIC IDs
+// aps, which [CPU.StartAPs] returned. It must be called once. Each AP
+// drops its address translations when it takes its first task, so the
+// caller may change the mappings of the start code before the call.
+func (cpu *CPU) UseAPs(aps []int) {
+	if len(aps) == 0 {
+		return
+	}
+
+	cpu.aps = aps
+	goos.ProcID = cpu.ID
+	goos.Task = cpu.Task
+	goos.Wake = cpu.Wake
+
+	runtime.GOMAXPROCS(len(aps) + 1)
+}
+
+// prepareAPs writes the start code of the APs and its data into the pages
+// from 0x4000 to 0x6fff.
+func (cpu *CPU) prepareAPs() {
+	// copy ·apinit to a 16-bit address reachable in real mode
+	// copy ·apstart pointer to avoid RIP/EIP-relative addressing
+	apinit_reloc(apinitAddress, apstartAddress)
+
+	// create AP Global Descriptor Table (GDT)
+	reg.Write64(gdtAddress+0x00, 0x0000000000000000) // null descriptor
+	reg.Write64(gdtAddress+0x08, 0x00af9a000000ffff) // code descriptor (x/r, 64-bit)
+	reg.Write64(gdtAddress+0x10, 0x00cf92000000ffff) // data descriptor (r/w, flat)
+
+	// create AP GDT Descriptor (GDTR)
+	reg.Write16(gdtrAddress+0x00, 3*8-1)      // GTD Limit
+	reg.Write32(gdtrAddress+0x02, gdtAddress) // GDT Base Address
+
+	// reset SMP semaphore/task
+	reg.Write64(taskSP, 0)
+	reg.Write64(taskGP, 0)
+	reg.Write64(taskPC, 0)
+
+	// read fresh CR3 as a cpuinit override might have overridden ours,
+	// the APs load it in 16-bit mode
+	cr3 := read_cr3()
+
+	if cr3 >= 1<<32 {
+		panic("page tables above 4 GiB")
+	}
+
+	reg.Write(cr3Address, uint32(cr3))
+
+	// the slots and their start stacks
+	if cpu.apStacks == nil {
+		cpu.apStacks = make([]byte, maxAPs*startStackSize)
+	}
+
+	for i := range uint32(maxAPs) {
+		reg.Write(apicTableAddress+4*i, noAPIC)
+	}
+
+	reg.Write(slotAddress, 0)
+	reg.Write64(stacksAddress, uint64(uintptr(unsafe.Pointer(&cpu.apStacks[0]))))
 }
 
 // Wake issues a wake interrupt (see [IRQ_WAKEUP]) to the target processor.

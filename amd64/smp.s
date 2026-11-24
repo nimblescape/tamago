@@ -11,7 +11,7 @@
 #include "textflag.h"
 
 // NOTE: this offset needs adjustment in case of any changes to ·apinit
-#define doneOffset 0x6c
+#define doneOffset 0x72
 #define doneMarker 0xcccccccccccccccc
 
 // func apinit_reloc(init uintptr, start uintptr)
@@ -39,6 +39,10 @@ done:
 
 	RET
 
+// All APs may run ·apinit and ·apstart at the same time (see
+// CPU.StartAPs). Therefore they write no shared memory that
+// another AP reads during its start, and each AP takes its own start
+// stack before it calls a function.
 TEXT ·apinit<>(SB),NOSPLIT|NOFRAME,$0
 	// disable interrupts
 	CLI
@@ -55,13 +59,16 @@ TEXT ·apinit<>(SB),NOSPLIT|NOFRAME,$0
 	// apply fresh CR3 as a cpuinit override might have overridden ours
 	DATA32
 	MOVL	$(const_cr3Address), AX
-
-	// we might not have a valid stack pointer for CALLs
 	DATA32; ADDR32
-	MOVL	(AX), SP
+	MOVL	(AX), BX
 
 	// apply BSP paging setup (see init.s)
-	MOVL	SP, CR3
+	MOVL	BX, CR3
+
+	// The far return to Long Mode below pushes the same values on every
+	// AP, so all APs share this stack.
+	DATA32
+	MOVL	$(const_sharedStackAddress), SP
 
 	// adjust data segment
 	BYTE	$0x8c; BYTE	$0xc8		// mov %cs,%ax
@@ -115,24 +122,31 @@ TEXT ·apinit<>(SB),NOSPLIT|NOFRAME,$0
 done:
 	// 64-bit Long Mode
 
-	// update GDT limits
-	MOVQ	$(const_gdtAddress), AX
-	ADDQ	$0x08, AX
-	MOVW	$0x0000, (AX)			// code descriptor limit
-	ADDQ	$0x08, AX
-	MOVW	$0x0000, (AX)			// data descriptor limit
-
-	// reload GDT
-	SUBQ	$0x10, AX
-	LGDT	(AX)
-
-	// call ·apstart (avoiding RIP/EIP relative addressing)
+	// jump to ·apstart (avoiding RIP/EIP relative addressing), which
+	// never returns
 	MOVQ	$(const_apstartAddress), AX
-	CALL	(AX)
+	JMP	(AX)
 marker:
 	WORD	$doneMarker
 
 TEXT ·apstart<>(SB),NOSPLIT|NOFRAME,$0
+	// take the next slot: a start stack and an entry of the APIC ID table
+	MOVQ	$(const_slotAddress), BX
+	MOVL	$1, R13
+	LOCK
+	XADDL	R13, 0(BX)
+	CMPL	R13, $(const_maxAPs)
+	JCC	park
+
+	// use the start stack of the slot, which ends at
+	// stacks + (slot+1)*startStackSize
+	MOVQ	$(const_stacksAddress), BX
+	MOVQ	0(BX), SP
+	MOVL	R13, CX
+	INCL	CX
+	SHLQ	$(const_startStackShift), CX
+	ADDQ	CX, SP
+
 	// enable SSE
 	CALL	sse_enable(SB)
 
@@ -147,12 +161,13 @@ TEXT ·apstart<>(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	$·idtptr(SB), AX
 	LIDT	(AX)
 
-	// restore GDT limits for next ·apinit
-	MOVQ	$(const_gdtAddress), AX
-	ADDQ	$0x08, AX
-	MOVW	$0xffff, (AX)			// code descriptor limit
-	ADDQ	$0x08, AX
-	MOVW	$0xffff, (AX)			// data descriptor limit
+	// write the APIC ID into the slot of the table, which tells that
+	// this AP is ready
+	MOVL	$(const_LAPIC_ID), CX
+	MOVL	(CX), CX
+	SHRL	$(const_ID), CX
+	MOVQ	$(const_apicTableAddress), BX
+	MOVL	CX, (BX)(R13*4)
 
 	// use taskAddress as counting semaphore for SMP enabling
 	MOVQ	$(const_taskAddress), BX
@@ -172,10 +187,15 @@ wait:
 	MOVQ	task_sp(AX), SP
 	MOVQ	task_gp(AX), g
 
-	// clear task
+	// clear task, pc last, as CPU.Task waits for it
 	MOVQ	$0, task_sp(AX)
 	MOVQ	$0, task_gp(AX)
 	MOVQ	$0, task_pc(AX)
+
+	// drop the address translations of the start code, which the caller
+	// of CPU.StartAPs may have unmapped
+	MOVQ	CR3, BX
+	MOVQ	BX, CR3
 
 	MOVQ	g, DI
 	CALL	·settls(SB)
@@ -193,6 +213,12 @@ wait:
 
 	// go back to idle state in case we return
 	JMP wait
+
+park:
+	// an AP without a slot stays halted
+	CLI
+	HLT
+	JMP	park
 
 TEXT ·settls(SB),NOSPLIT,$0
 	ADDQ	$8, DI	// ELF wants to use -8(FS)

@@ -21,6 +21,7 @@ import (
 	"math"
 	"runtime"
 	"runtime/goos"
+	"sync/atomic"
 	_ "unsafe"
 
 	"github.com/usbarmory/tamago/amd64/lapic"
@@ -73,6 +74,13 @@ type CPU struct {
 
 	// init represents the last initialized CPU index
 	init int
+	// aps holds the APIC IDs of the APs that StartAPs found, in the
+	// order in which Task starts them, or nil
+	aps []int
+	// apStacks holds the start stacks of the APs (see prepareAPs)
+	apStacks []byte
+	// taskLock serializes Task
+	taskLock atomic.Bool
 	// features
 	features Features
 	// core frequency in Hz
