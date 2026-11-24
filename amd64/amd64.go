@@ -18,6 +18,8 @@
 package amd64
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"runtime"
 	"runtime/goos"
@@ -53,7 +55,30 @@ const (
 	LAPIC_TIMER_INIT = LAPIC_BASE + lapic.LAPIC_LVT_TIMER_INIT
 	LAPIC_TIMER_CUR  = LAPIC_BASE + lapic.LAPIC_LVT_TIMER_CURRENT
 	LAPIC_TIMER_DIV  = LAPIC_BASE + lapic.LAPIC_LVT_TIMER_DIV
+
+	msrAPICBase    = lapic.MSR_APIC_BASE
+	apicBaseEnable = lapic.APIC_BASE_ENABLE
+	apicBaseX2APIC = lapic.APIC_BASE_X2APIC
 )
+
+// The MSRs of the LAPIC registers that the assembly code uses in x2APIC
+// mode (see the LAPIC macros in amd64.h).
+const (
+	x2apicID  = lapic.MSR_X2APIC + lapic.LAPIC_ID>>4
+	x2apicEOI = lapic.MSR_X2APIC + lapic.LAPIC_EOI>>4
+	x2apicSVR = lapic.MSR_X2APIC + lapic.LAPIC_SVR>>4
+	x2apicICR = lapic.MSR_X2APIC + lapic.LAPIC_ICRL>>4
+)
+
+// maxAPICID is the largest APIC ID that the package supports, in both modes
+// of the LAPIC: the IRQ_WAKEUP flags (irqWake) and the messages of MSI-X
+// interrupts (see lapic.MSI) hold 8-bit APIC IDs, and 255 is the broadcast
+// ID of the xAPIC.
+const maxAPICID = 254
+
+// x2apic tells the assembly code that the LAPIC is in x2APIC mode (see
+// [CPU.InitLAPIC] and the LAPIC macros in amd64.h).
+var x2apic bool
 
 //go:linkname ramStackOffset runtime/goos.RamStackOffset
 var ramStackOffset uint64 = 0x100000 // 1 MB
@@ -127,6 +152,57 @@ func (cpu *CPU) Init() {
 	reg.Write64(taskAddress+0x00, 0)
 	reg.Write64(taskAddress+0x08, 0)
 	reg.Write64(taskAddress+0x10, 0)
+}
+
+// InitLAPIC reads the mode in which the firmware has enabled the LAPIC of the
+// BSP and accesses the LAPIC in that mode from then on: in xAPIC mode
+// through the memory at [LAPIC_BASE], in x2APIC mode through MSRs.
+// Firmware may choose the x2APIC mode also on a system with fewer than 256
+// processors, and a processor leaves the x2APIC mode only by disabling its
+// LAPIC. So a program on bare metal calls InitLAPIC after [CPU.Init] and
+// before it uses interrupts. Without InitLAPIC, the package uses the xAPIC
+// mode, as in a virtual machine, where the read of the mode may trap.
+//
+// InitLAPIC returns an error and keeps the xAPIC mode when the LAPIC is
+// disabled, when it is in xAPIC mode at another address than LAPIC_BASE, or
+// when the APIC ID of the BSP is above 254.
+func (cpu *CPU) InitLAPIC() error {
+	_, x2, _ := lapic.Mode()
+
+	if err := checkLAPIC(x2); err != nil {
+		return err
+	}
+
+	l := &lapic.LAPIC{Base: LAPIC_BASE, X2APIC: x2}
+
+	if id := l.ID(); id > maxAPICID {
+		return fmt.Errorf("the APIC ID %d of the BSP is above %d", id, maxAPICID)
+	}
+
+	cpu.LAPIC = l
+	x2apic = x2
+
+	return nil
+}
+
+// checkLAPIC returns an error unless the LAPIC of the calling processor is
+// enabled in x2APIC mode when x2 is true, else in xAPIC mode at
+// [LAPIC_BASE].
+func checkLAPIC(x2 bool) error {
+	enabled, mode, base := lapic.Mode()
+
+	switch {
+	case !enabled:
+		return errors.New("the LAPIC is disabled")
+	case mode && !x2:
+		return errors.New("the LAPIC is in x2APIC mode, and the package uses the xAPIC mode (see CPU.InitLAPIC)")
+	case !mode && x2:
+		return errors.New("the LAPIC is in xAPIC mode, and the package uses the x2APIC mode")
+	case !mode && base != LAPIC_BASE:
+		return fmt.Errorf("the LAPIC is at %#x, not at %#x", base, LAPIC_BASE)
+	}
+
+	return nil
 }
 
 // Name returns the CPU identifier.

@@ -176,20 +176,41 @@ TEXT ·apstart<>(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	$·idtptr(SB), AX
 	LIDT	(AX)
 
+	// Use the LAPIC in the mode of the BSP (see CPU.InitLAPIC). An INIT
+	// keeps the mode, so the firmware has usually set it already. The
+	// LAPIC enters the x2APIC mode only from the xAPIC mode, and leaves
+	// it only when it is disabled, so an AP in x2APIC mode stays halted
+	// when the BSP uses the xAPIC mode.
+	MOVL	$(const_msrAPICBase), CX
+	RDMSR
+	MOVB	·x2apic(SB), BX
+	CMPB	BX, $0
+	JNE	x2apic
+	TESTL	$(1<<const_apicBaseX2APIC), AX
+	JNZ	park
+	JMP	ready
+x2apic:
+	TESTL	$(1<<const_apicBaseX2APIC), AX
+	JNZ	ready
+	ORL	$(1<<const_apicBaseEnable), AX
+	WRMSR
+	ORL	$(1<<const_apicBaseX2APIC), AX
+	WRMSR
+ready:
 	// write the APIC ID into the slot of the table, which tells that
-	// this AP is ready
-	MOVL	$(const_LAPIC_ID), CX
-	MOVL	(CX), CX
-	SHRL	$(const_ID), CX
+	// this AP is ready, unless the package does not support the APIC ID
+	LAPIC_ID_AX
+	CMPL	AX, $(const_maxAPICID)
+	JHI	park
 	MOVQ	$(const_apicTableAddress), BX
-	MOVL	CX, (BX)(R13*4)
+	MOVL	AX, (BX)(R13*4)
 
 	// enable LAPIC, so that the AP takes interrupts while it waits for
 	// its task: the event vectors of the devices may name it. Spurious
 	// interrupts take the vector of IRQ_WAKEUP, whose handler only
 	// records a wake-up, as on the BSP (see CPU.EnableEvents).
-	MOVL	$(const_LAPIC_SVR), AX
-	MOVL	$(1<<const_SVR_ENABLE | const_IRQ_WAKEUP), (AX)
+	MOVL	$(1<<const_SVR_ENABLE | const_IRQ_WAKEUP), AX
+	LAPIC_WRITE_AX(const_LAPIC_SVR, const_x2apicSVR)
 
 	// use taskAddress as counting semaphore for SMP enabling
 	MOVQ	$(const_taskAddress), BX

@@ -6,6 +6,7 @@
 // Use of this source code is governed by the license
 // that can be found in the LICENSE file.
 
+#include "amd64.h"
 #include "go_asm.h"
 #include "textflag.h"
 
@@ -74,9 +75,7 @@ TEXT ·wfi(SB),NOSPLIT|NOFRAME,$0
 	CLI
 
 	// locate the IRQ_WAKEUP flag of this processor
-	MOVL	$(const_LAPIC_ID), AX
-	MOVL	(AX), AX
-	SHRL	$(const_ID), AX
+	LAPIC_ID_AX
 	LEAQ	·irqWake(SB), BX
 	ADDQ	AX, BX
 
@@ -107,19 +106,20 @@ TEXT ·ignoreInterrupt(SB),NOSPLIT|NOFRAME,$0
 	// save caller registers
 	PUSHQ	AX
 	PUSHQ	BX
+	PUSHQ	CX
+	PUSHQ	DX
 
 	// record the wakeup for wfi, which may not have halted yet
-	MOVL	$(const_LAPIC_ID), AX
-	MOVL	(AX), AX
-	SHRL	$(const_ID), AX
+	LAPIC_ID_AX
 	LEAQ	·irqWake(SB), BX
 	MOVB	$1, (BX)(AX*1)
 
 	// clear interrupt
-	MOVL	$(const_LAPIC_EOI), AX
-	MOVL	$0, (AX)
+	LAPIC_SEND_EOI
 
 	// restore caller registers
+	POPQ	DX
+	POPQ	CX
 	POPQ	BX
 	POPQ	AX
 
@@ -134,12 +134,15 @@ TEXT ·kickInterrupt(SB),NOSPLIT|NOFRAME,$0
 
 	// save caller registers
 	PUSHQ	AX
+	PUSHQ	CX
+	PUSHQ	DX
 
 	// clear interrupt
-	MOVL	$(const_LAPIC_EOI), AX
-	MOVL	$0, (AX)
+	LAPIC_SEND_EOI
 
 	// restore caller registers
+	POPQ	DX
+	POPQ	CX
 	POPQ	AX
 
 	// return to caller
@@ -175,9 +178,12 @@ TEXT ·handleInterrupt(SB),NOSPLIT|NOFRAME,$0
 	CALL	os∕signal·Relay(SB)
 	ADDQ	$8, SP
 
-	// wake idle APs
-	MOVL	$(const_LAPIC_ICRL), AX
-	MOVL	$(const_ICR_DST_REST|const_IRQ_WAKEUP), (AX)
+	// wake idle APs, after the stores of the relay are visible to them
+	// (see reg.WriteMSRFenced)
+	MFENCE
+	LFENCE
+	MOVL	$(const_ICR_DST_REST|const_IRQ_WAKEUP), AX
+	LAPIC_WRITE_AX(const_LAPIC_ICRL, const_x2apicICR)
 
 	// restore caller registers
 	POPQ	AX
@@ -204,18 +210,21 @@ TEXT ·handleRelay(SB),NOSPLIT|NOFRAME,$0
 
 	// save caller registers
 	PUSHQ	AX
+	PUSHQ	CX
+	PUSHQ	DX
 
-	MOVL	$(const_LAPIC_EOI), AX
 	// clear this interrupt
-	MOVL	$0, (AX)
+	LAPIC_SEND_EOI
 	// clear the serviced interrupt
-	MOVL	$0, (AX)
+	LAPIC_SEND_EOI
 
 	// accept device interrupts again
 	XORQ	AX, AX
 	MOVQ	AX, CR8
 
 	// restore caller registers
+	POPQ	DX
+	POPQ	CX
 	POPQ	AX
 
 	// return to caller

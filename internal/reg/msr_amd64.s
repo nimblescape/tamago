@@ -22,3 +22,14 @@ TEXT ·WriteMSR(SB),$0-16
 	SHRQ	$32, DX
 	WRMSR
 	RET
+
+// func WriteMSRFenced(addr uint64, val uint64)
+TEXT ·WriteMSRFenced(SB),$0-16
+	MFENCE
+	LFENCE
+	MOVQ	addr+0(FP), CX
+	MOVQ	val+8(FP),  AX
+	MOVQ	AX, DX
+	SHRQ	$32, DX
+	WRMSR
+	RET

@@ -10,6 +10,12 @@
 // Programmable Interrupt Controllers adopting the following reference
 // specifications:
 //   - Intel® 64 and IA-32 Architectures Software Developer’s Manual - Volume 3A - Chapter 10
+//   - Intel® 64 and IA-32 Architectures Software Developer’s Manual - Volume 3A - 11.12 Extended XAPIC (x2APIC)
+//
+// The driver supports both modes of the LAPIC: the xAPIC mode, in which the
+// registers are memory at the base address, and the x2APIC mode, in which
+// the registers are Model Specific Registers (MSRs) and the APIC IDs have 32
+// bits. The firmware chooses the mode (see [Mode]).
 //
 // This package is only meant to be used with `GOOS=tamago` as
 // supported by the TamaGo framework for bare metal Go, see
@@ -66,55 +72,117 @@ const (
 	LAPIC_LVT_TIMER_DIV     = 0x3e0
 )
 
+// The MSR of the base address and the mode of the LAPIC, and the MSRs of the
+// registers in x2APIC mode: the register at offset off of the xAPIC mode is
+// the MSR MSR_X2APIC + off>>4.
+const (
+	MSR_APIC_BASE    = 0x1b
+	APIC_BASE_ENABLE = 11
+	APIC_BASE_X2APIC = 10
+	APIC_BASE_ADDR   = 0x000ffffffffff000
+
+	MSR_X2APIC = 0x800
+)
+
+// Mode reads the mode of the LAPIC of the calling processor from its base
+// address MSR: whether the LAPIC is enabled, whether it is in x2APIC mode
+// and, in xAPIC mode, the base address of its registers.
+func Mode() (enabled bool, x2apic bool, base uint64) {
+	msr := reg.ReadMSR(MSR_APIC_BASE)
+	return msr&(1<<APIC_BASE_ENABLE) != 0, msr&(1<<APIC_BASE_X2APIC) != 0, msr & APIC_BASE_ADDR
+}
+
 // LAPIC represents a Local APIC instance.
 type LAPIC struct {
 	// Base register
 	Base uint32
+	// X2APIC selects the x2APIC mode: the registers are MSRs and the
+	// APIC IDs have 32 bits. Without it, the registers are memory at
+	// Base (xAPIC mode).
+	X2APIC bool
 }
 
-// ID returns the LAPIC identification register.
+// Read returns the register at offset off of the xAPIC mode, such as
+// LAPIC_SVR, in the mode of the LAPIC.
+func (io *LAPIC) Read(off uint32) uint32 {
+	if io.X2APIC {
+		return uint32(reg.ReadMSR(MSR_X2APIC + uint64(off>>4)))
+	}
+
+	return reg.Read(io.Base + off)
+}
+
+// Write writes the register at offset off of the xAPIC mode, such as
+// LAPIC_SVR, in the mode of the LAPIC.
+func (io *LAPIC) Write(off uint32, val uint32) {
+	if io.X2APIC {
+		reg.WriteMSR(MSR_X2APIC+uint64(off>>4), uint64(val))
+		return
+	}
+
+	// no reg.Set as we do not emulate atomic MMIO ops under SEV-SNP
+	reg.Write(io.Base+off, val)
+}
+
+// ID returns the APIC ID of the calling processor: 8 bits in xAPIC mode,
+// 32 bits in x2APIC mode.
 func (io *LAPIC) ID() uint32 {
-	return reg.GetN(io.Base+LAPIC_ID, ID, 0xff)
+	if io.X2APIC {
+		return io.Read(LAPIC_ID)
+	}
+
+	return io.Read(LAPIC_ID) >> ID & 0xff
 }
 
 // Version returns the LAPIC version register.
 func (io *LAPIC) Version() uint32 {
-	return reg.Read(io.Base + LAPIC_VER)
+	return io.Read(LAPIC_VER)
 }
 
 // Entries returns the size of the LAPIC local vector table.
 func (io *LAPIC) Entries() int {
-	maxIndex := reg.GetN(io.Base+LAPIC_VER, VER_ENTRIES, 0xff)
+	maxIndex := io.Read(LAPIC_VER) >> VER_ENTRIES & 0xff
 	return int(maxIndex) + 1
 }
 
 // Enable enables the Local APIC.
 func (io *LAPIC) Enable() {
-	svr := reg.Read(io.Base + LAPIC_SVR)
+	svr := io.Read(LAPIC_SVR)
 	bits.Set(&svr, SVR_ENABLE)
-
-	// no reg.Set as we do not emulate atomic MMIO ops under SEV-SNP
-	reg.Write(io.Base+LAPIC_SVR, svr)
+	io.Write(LAPIC_SVR, svr)
 }
 
 // Disable disables the Local APIC.
 func (io *LAPIC) Disable() {
-	reg.Clear(io.Base+LAPIC_SVR, SVR_ENABLE)
+	svr := io.Read(LAPIC_SVR)
+	bits.Clear(&svr, SVR_ENABLE)
+	io.Write(LAPIC_SVR, svr)
 }
 
 // ClearInterrupt signals the end of an interrupt handling routine.
 func (io *LAPIC) ClearInterrupt() {
-	reg.Write(io.Base+LAPIC_EOI, 0)
+	io.Write(LAPIC_EOI, 0)
 }
 
-// IPI sends an Inter-Processor Interrupt (IPI).
+// IPI sends an Inter-Processor Interrupt (IPI). In x2APIC mode, the
+// interrupt command register is one 64-bit MSR with the 32-bit APIC ID of
+// the destination in its upper half, and it has no delivery status. The
+// write waits for the earlier stores, so that the destination sees them
+// when it takes the interrupt, as in xAPIC mode.
 func (io *LAPIC) IPI(apicid int, id int, flags int) {
+	low := uint32(flags&0xffffff00) | uint32(id&0xff)
+
+	if io.X2APIC {
+		reg.WriteMSRFenced(MSR_X2APIC+LAPIC_ICRL>>4, uint64(uint32(apicid))<<32|uint64(low))
+		return
+	}
+
 	icrh := reg.Read(io.Base + LAPIC_ICRH)
 	bits.SetN(&icrh, ID, 0xff, uint32(apicid))
 
 	// no reg.Set as we do not emulate atomic MMIO ops under SEV-SNP
 	reg.Write(io.Base+LAPIC_ICRH, icrh)
-	reg.Write(io.Base+LAPIC_ICRL, uint32(flags&0xffffff00)|uint32(id&0xff))
+	reg.Write(io.Base+LAPIC_ICRL, low)
 	reg.Wait(io.Base+LAPIC_ICRL, ICR_DLV_STATUS, 1, 0)
 }
 
@@ -125,7 +193,7 @@ func (io *LAPIC) SetTimer(id int, mode int) {
 	bits.SetN(&val, TIMER_IRQ, 0xff, uint32(id))
 	bits.SetN(&val, TIMER_MODE, 0b11, uint32(mode))
 
-	reg.Write(io.Base+LAPIC_LVT_TIMER, val)
+	io.Write(LAPIC_LVT_TIMER, val)
 }
 
 // MSI message (Intel® 64 and IA-32 Architectures Software Developer’s Manual
@@ -137,7 +205,9 @@ const (
 
 // MSI returns the message address and data of an MSI or MSI-X interrupt with
 // the argument vector to the processor with the argument APIC ID: fixed
-// delivery, edge triggered, physical destination mode.
+// delivery, edge triggered, physical destination mode. The address holds 8
+// bits of the APIC ID, in x2APIC mode too, so the processor needs an APIC
+// ID below 255.
 func MSI(apicid int, vector int) (addr uint64, data uint32) {
 	return MSI_ADDRESS | uint64(apicid&0xff)<<MSI_DEST, uint32(vector & 0xff)
 }

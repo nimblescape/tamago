@@ -76,19 +76,21 @@ func (cpu *CPU) calibrateByACPITimer() {
 
 // calibrate frequency based on QEMU LAPIC timer
 func (cpu *CPU) calibrateByLAPICTimer() {
-	reg.Write(LAPIC_SVR, reg.Read(LAPIC_SVR)|0x1ff)
-	reg.Write(LAPIC_TIMER_DIV, 0b1011)
-	reg.Write(LAPIC_TIMER, 1<<16|IRQ_WAKEUP)
+	l := cpu.LAPIC
 
-	reg.Write(LAPIC_TIMER_INIT, 0xffffffff)
-	defer reg.Write(LAPIC_TIMER_INIT, 0)
+	l.Write(lapic.LAPIC_SVR, l.Read(lapic.LAPIC_SVR)|0x1ff)
+	l.Write(lapic.LAPIC_LVT_TIMER_DIV, 0b1011)
+	l.Write(lapic.LAPIC_LVT_TIMER, 1<<16|IRQ_WAKEUP)
+
+	l.Write(lapic.LAPIC_LVT_TIMER_INIT, 0xffffffff)
+	defer l.Write(lapic.LAPIC_LVT_TIMER_INIT, 0)
 
 	t0 := read_tsc()
 	elapsed := uint32(0)
 
 	// 20ms at 1 GHz
 	for elapsed < qemuTimerFreq/50 {
-		elapsed = 0xffffffff - reg.Read(LAPIC_TIMER_CUR)
+		elapsed = 0xffffffff - l.Read(lapic.LAPIC_LVT_TIMER_CURRENT)
 	}
 
 	t1 := read_tsc()

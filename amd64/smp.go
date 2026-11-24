@@ -9,7 +9,6 @@
 package amd64
 
 import (
-	"errors"
 	"runtime"
 	"runtime/goos"
 	"time"
@@ -61,9 +60,8 @@ const (
 	apicTableAddress = 0x6100
 	noAPIC           = 0xffffffff
 
-	// maxAPs is the number of slots, as an xAPIC addresses up to 255
-	// processors with its 8-bit APIC IDs. An AP without a slot stays
-	// halted.
+	// maxAPs is the number of slots, one for each APIC ID up to
+	// maxAPICID. An AP without a slot stays halted.
 	maxAPs = 255
 
 	// startStackSize is the size of the start stack of a slot, which
@@ -233,9 +231,10 @@ func (cpu *CPU) InitSMP(n int) {
 // when it is ready, and StartAPs returns the APIC IDs of the ready APs in
 // the order of their arrival. The runtime uses them after [CPU.UseAPs].
 //
-// The table holds the 8-bit APIC IDs of the xAPIC, so StartAPs supports
-// systems whose APIC IDs fit 8 bits, with the LAPIC at [LAPIC_BASE] in
-// xAPIC mode. It returns an error and starts no AP on other systems.
+// The APs use the LAPIC in the mode of the BSP (see [CPU.InitLAPIC]), and
+// StartAPs returns an error and starts no AP when the LAPIC of the BSP is
+// not in that mode. The package supports APIC IDs up to 254, so an AP with
+// a larger APIC ID stays halted.
 //
 // A ready AP takes interrupts while it waits for the runtime to start a
 // thread on it, so that a device may send interrupts to any AP that
@@ -248,7 +247,7 @@ func (cpu *CPU) InitSMP(n int) {
 // the page at 0x5000 after the call. The page at 0x6000 must stay mapped
 // and writable while the runtime starts tasks on the APs.
 func (cpu *CPU) StartAPs() ([]int, error) {
-	if err := cpu.checkXAPIC(); err != nil {
+	if err := checkLAPIC(cpu.LAPIC.X2APIC); err != nil {
 		return nil, err
 	}
 
@@ -311,34 +310,8 @@ func (cpu *CPU) UseAPs(aps []int) {
 	runtime.GOMAXPROCS(len(aps) + 1)
 }
 
-// The MSR of the page attributes and the MSR of the base address and the
-// mode of the LAPIC (AMD64 Architecture Programmer’s Manual, Volume 2 -
-// 16.3.1 Local APIC Enable).
-const (
-	msrPAT      = 0x277
-	msrAPICBase = 0x1b
-
-	apicBaseEnable = 1 << 11
-	apicBaseX2APIC = 1 << 10
-	apicBaseMask   = 0x000ffffffffff000
-)
-
-// checkXAPIC returns an error unless the LAPIC is enabled in xAPIC mode
-// at [LAPIC_BASE], which the start of the APs needs.
-func (cpu *CPU) checkXAPIC() error {
-	base := cpu.MSR(msrAPICBase)
-
-	switch {
-	case base&apicBaseEnable == 0:
-		return errors.New("the LAPIC is disabled")
-	case base&apicBaseX2APIC != 0:
-		return errors.New("the LAPIC is in x2APIC mode, and the start of the APs supports only the xAPIC mode")
-	case base&apicBaseMask != LAPIC_BASE:
-		return errors.New("the LAPIC is not at its default address")
-	}
-
-	return nil
-}
+// msrPAT is the MSR of the page attributes.
+const msrPAT = 0x277
 
 // prepareAPs writes the start code of the APs and its data into the pages
 // from 0x4000 to 0x6fff.

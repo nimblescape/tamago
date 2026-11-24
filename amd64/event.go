@@ -11,7 +11,7 @@ package amd64
 import (
 	"runtime/goos"
 
-	"github.com/usbarmory/tamago/internal/reg"
+	"github.com/usbarmory/tamago/amd64/lapic"
 )
 
 // Event vectors connect each interrupt source with its own goroutine. The
@@ -41,8 +41,7 @@ func eventTableAddress() uintptr
 func (cpu *CPU) EnableEvents() {
 	setGates(EventFirst, EventLast, eventTableAddress()-EventFirst*callSize)
 
-	// no reg.Set as we do not emulate atomic MMIO ops under SEV-SNP
-	reg.Write(LAPIC_SVR, 1<<SVR_ENABLE|IRQ_WAKEUP)
+	cpu.LAPIC.Write(lapic.LAPIC_SVR, 1<<SVR_ENABLE|IRQ_WAKEUP)
 }
 
 // WaitEvent blocks the calling goroutine until an interrupt with the event

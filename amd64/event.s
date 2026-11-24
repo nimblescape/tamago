@@ -6,6 +6,7 @@
 // Use of this source code is governed by the license
 // that can be found in the LICENSE file.
 
+#include "amd64.h"
 #include "go_asm.h"
 #include "textflag.h"
 
@@ -27,12 +28,14 @@ TEXT ·handleEvent(SB),NOSPLIT|NOFRAME,$0
 	// save caller registers
 	PUSHQ	AX
 	PUSHQ	BX
+	PUSHQ	CX
+	PUSHQ	DX
 
 	// AMD64 Architecture Programmer’s Manual
 	// Volume 2 - 8.9.3 Interrupt Stack Frame
 
 	// the vector from the return address of the entry
-	MOVQ	16(SP), AX
+	MOVQ	32(SP), AX
 	MOVQ	$·eventTable(SB), BX
 	SUBQ	BX, AX
 	IMULQ	$52429, AX
@@ -45,10 +48,11 @@ TEXT ·handleEvent(SB),NOSPLIT|NOFRAME,$0
 	ADDQ	$8, SP
 
 	// clear interrupt
-	MOVL	$(const_LAPIC_EOI), AX
-	MOVL	$0, (AX)
+	LAPIC_SEND_EOI
 
 	// restore caller registers
+	POPQ	DX
+	POPQ	CX
 	POPQ	BX
 	POPQ	AX
 
