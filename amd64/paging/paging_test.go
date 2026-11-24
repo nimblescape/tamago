@@ -192,6 +192,10 @@ func TestUnmapReclaim(t *testing.T) {
 		t.Errorf("Reclaim before Unmap: got %v", err)
 	}
 
+	if err := s.Reclaim(4*gib, 2*mib, func(_, _ uint64) { t.Error("frame of a page that was never mapped") }); err != nil {
+		t.Errorf("Reclaim of a range that was never mapped: %v", err)
+	}
+
 	// Unmap one 4 KiB page inside the 2 MiB page: it splits.
 	if err := s.Unmap(gib+mib, 4*kib); err != nil {
 		t.Fatal(err)
@@ -210,6 +214,20 @@ func TestUnmapReclaim(t *testing.T) {
 	}
 
 	var freed []uint64
+
+	// The range reaches beyond the end of the mapping: those pages were
+	// never mapped and are skipped.
+	if err := s.Unmap(gib+2*mib+4*kib, 4*kib); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Reclaim(gib+2*mib+4*kib, 64*kib, func(phys, size uint64) {
+		freed = append(freed, phys, size)
+	}); err != nil || len(freed) != 2 || freed[0] != 8*gib+2*mib+4*kib {
+		t.Errorf("Reclaim beyond the mapping: %v, freed %#x", err, freed)
+	}
+
+	freed = nil
 
 	if err := s.Reclaim(gib+mib, 4*kib, func(phys, size uint64) {
 		freed = append(freed, phys, size)

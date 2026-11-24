@@ -24,7 +24,7 @@
 //  1. Unmap clears the present bit of each page and keeps its address.
 //  2. The caller flushes the TLB of every core.
 //  3. Reclaim clears the entries and reports the frames, which the caller
-//     may then free.
+//     may then free. Pages that were never mapped do not disturb it.
 //
 // Map refuses a range in which any page is still waiting for Reclaim.
 //
@@ -98,8 +98,9 @@ var (
 	ErrMapped = errors.New("paging: page in use")
 	// ErrNotMapped means that a page of the range is not mapped.
 	ErrNotMapped = errors.New("paging: page not mapped")
-	// ErrNotUnmapped means that a page of the range is still mapped or
-	// was never mapped, so Reclaim cannot take it.
+	// ErrNotUnmapped means that a page of the range is still mapped, or
+	// that a large page lies only in part in the range, so Reclaim
+	// cannot take it.
 	ErrNotUnmapped = errors.New("paging: page not unmapped")
 	// ErrAlign means that the physical address does not fit the page
 	// size that the range needs.
@@ -228,10 +229,11 @@ func (s *Space) Unmap(virt, size uint64) error {
 	return nil
 }
 
-// Reclaim clears the entries of the range of size bytes from virt on,
-// which Unmap unmapped and whose TLB entries the caller flushed on every
-// core, and calls free with the physical address and the size of each page
-// of the range. free must not change the address space.
+// Reclaim clears the entries of the pages of the range of size bytes from
+// virt on, which Unmap unmapped and whose TLB entries the caller flushed on
+// every core, and calls free with the physical address and the size of
+// each of these pages. Pages of the range that are not mapped at all are
+// skipped. free must not change the address space.
 func (s *Space) Reclaim(virt, size uint64, free func(phys, size uint64)) error {
 	if err := checkRange(virt, size); err != nil {
 		return err
@@ -366,15 +368,16 @@ func (s *Space) mapped(level int, addr, base, start, end uint64) bool {
 	})
 }
 
-// unmapped reports whether every page of the range from start to end
-// waits for Reclaim, and no large page lies only partly in the range.
+// unmapped reports whether no page of the range from start to end is
+// mapped, and no large page that waits for Reclaim lies only partly in the
+// range.
 func (s *Space) unmapped(level int, addr, base, start, end uint64) bool {
 	return s.walk(level, addr, base, start, end, func(p *uint64, eStart, lo, hi uint64) bool {
 		e := atomic.LoadUint64(p)
 
 		switch {
 		case e == 0:
-			return false
+			return true
 		case isLeaf(level, e):
 			return e&uint64(Present) == 0 && lo == eStart && hi == eStart+spans[level]
 		default:
@@ -559,15 +562,14 @@ func (s *Space) undo(level int, addr, base, start, end, off, f uint64) {
 // and reports each page to free.
 func (s *Space) reclaim(level int, addr, base, start, end uint64, free func(phys, size uint64)) {
 	s.walk(level, addr, base, start, end, func(p *uint64, eStart, lo, hi uint64) bool {
-		e := atomic.LoadUint64(p)
-
-		if !isLeaf(level, e) {
+		switch e := atomic.LoadUint64(p); {
+		case e == 0:
+		case isLeaf(level, e):
+			atomic.StoreUint64(p, 0)
+			free(e&addrMask&^(spans[level]-1), spans[level])
+		default:
 			s.reclaim(level+1, e&addrMask, eStart, lo, hi, free)
-			return true
 		}
-
-		atomic.StoreUint64(p, 0)
-		free(e&addrMask&^(spans[level]-1), spans[level])
 
 		return true
 	})
