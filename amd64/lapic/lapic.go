@@ -74,7 +74,7 @@ type LAPIC struct {
 
 // ID returns the LAPIC identification register.
 func (io *LAPIC) ID() uint32 {
-	return reg.GetN(io.Base+LAPIC_ID, ID, 0xf)
+	return reg.GetN(io.Base+LAPIC_ID, ID, 0xff)
 }
 
 // Version returns the LAPIC version register.
