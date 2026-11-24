@@ -86,6 +86,12 @@ const (
 // defined in smp.s
 func apinit_reloc(init uintptr, start uintptr)
 
+// apTLS holds the thread-local storage (TLS) block of each slot. The AP of
+// the slot points its FS base at the block, and the runtime keeps the
+// current goroutine (g) there, as it keeps the g of the BSP in m0.tls. An M
+// never leaves its AP, so the block of the slot serves its M.
+var apTLS [maxAPs]uint64
+
 // task represents a CPU task
 type task struct {
 	sp uint64 // stack pointer

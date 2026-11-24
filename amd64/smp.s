@@ -197,6 +197,11 @@ x2apic:
 	ORL	$(1<<const_apicBaseX2APIC), AX
 	WRMSR
 ready:
+	// point the FS base at the TLS block of the slot (see apTLS)
+	LEAQ	·apTLS(SB), DI
+	LEAQ	(DI)(R13*8), DI
+	CALL	·settls(SB)
+
 	// write the APIC ID into the slot of the table, which tells that
 	// this AP is ready, unless the package does not support the APIC ID
 	LAPIC_ID_AX
@@ -243,8 +248,7 @@ wait:
 	MOVQ	CR3, BX
 	MOVQ	BX, CR3
 
-	MOVQ	g, DI
-	CALL	·settls(SB)
+	// keep g in the TLS block of the slot, where the runtime reads it
 	// The two-instruction form also builds with -buildmode=pie.
 	MOVQ	TLS, AX
 	MOVQ	g, 0(AX)(TLS*1)
