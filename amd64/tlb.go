@@ -57,7 +57,16 @@ func tlbBroadcast() (apicid uint32)
 // with interrupts enabled, after [CPU.EnableExceptions]: two processors
 // that call it at once then answer the shootdown of each other. A
 // processor that does not answer within one second stops the program.
+//
+// Before the other processors run the program (see [CPU.UseAPs]), FlushTLB
+// sends no interrupt, because the firmware may still hold them with
+// interrupt handlers that are gone.
 func (cpu *CPU) FlushTLB() {
+	if len(cpu.cores) < 2 {
+		flush_tlb()
+		return
+	}
+
 	// The changes of the caller are visible before the new generation,
 	// as the processor keeps the order of stores and the addition is a
 	// locked instruction.
