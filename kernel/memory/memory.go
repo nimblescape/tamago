@@ -48,8 +48,8 @@ const (
 	// High is the memory from 4 GiB on outside the DMA region, such as
 	// the memory of the Go runtime.
 	High
-	// DMA is the fixed DMA region that the platform names (see New). It
-	// holds only DMA buffers and keeps its place and size; on amd64 it
+	// DMA is the fixed DMA region (see Manager.StartDMA). It holds only
+	// the DMA parts of devices and keeps its place and size; on amd64 it
 	// lies below 4 GiB, for devices with 32-bit DMA addresses.
 	DMA
 )

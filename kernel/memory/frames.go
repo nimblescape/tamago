@@ -56,7 +56,7 @@ func Words(ranges []Range, dma Range) (int, error) {
 // of the DMA region, so that each area lies in one zone.
 //
 // dma is the fixed DMA region, which the platform names: whole frames of
-// the ranges, which only DMA buffers use (zone DMA). It may be empty.
+// the ranges, which only DMA parts use (zone DMA). It may be empty.
 //
 // storage holds the bitmaps. It must have Words(ranges, dma) words, lie
 // outside ranges and stay with the frames for their whole life. New clears

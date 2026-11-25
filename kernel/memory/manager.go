@@ -27,12 +27,13 @@ type Config struct {
 	// kernel memory (Alloc). No other mapping lies in it.
 	Window Range
 	// Memory are the physical ranges of memory. No device registers lie
-	// there, so MapDevice refuses them.
+	// there, so Give refuses them as registers.
 	Memory []Range
 	// Windows are other ranges of virtual addresses of Space, such as
-	// the window of the Go memory (see Provider). DMA buffers and device
-	// registers are mapped 1:1, at their physical addresses, so none of
-	// them may lie in a window or in Window.
+	// the window of the Go memory (see Provider). The DMA region and the
+	// registers of the devices of the kernel are mapped 1:1, at their
+	// physical addresses, so none of them may lie in a window or in
+	// Window.
 	Windows []Range
 	// Owners are owners that exist before the Manager, such as the owner
 	// of the page tables of Space.
@@ -40,11 +41,13 @@ type Config struct {
 }
 
 // Manager is the memory manager of a kernel. It gives its owners the
-// memory of the kernel in three kinds of pieces:
+// memory of the kernel in two kinds of pieces:
 //
-//   - DMA buffers: contiguous frames, mapped 1:1 in the address space of
-//     the kernel and in the IOMMU domain of the owner (DMA);
-//   - the registers of a device, mapped 1:1 as device memory (MapDevice);
+//   - devices (Give): the registers of a device, mapped as device memory,
+//     and its DMA part, a fixed piece of the DMA region (StartDMA), both
+//     for the processor of the owner, and the part also in the IOMMU
+//     domain of the owner. A driver in the kernel and a process get their
+//     devices through the same call;
 //   - regions of kernel memory between guard pages, at virtual addresses
 //     of the window of the kernel (Alloc).
 //
@@ -61,6 +64,16 @@ type Manager struct {
 
 	lock   sync.Mutex
 	owners []*Owner
+	given  []Range // the registers of the devices that Give gave
+
+	dmaLock sync.Mutex                // serializes StartDMA
+	dma     atomic.Pointer[dmaRegion] // the DMA region, nil before StartDMA
+}
+
+// dmaRegion is the DMA region of a Manager.
+type dmaRegion struct {
+	frames *Frames // the frames of the region, all in zone DMA
+	parts  *Owner  // counts the frames of the DMA parts, which no limit counts
 }
 
 // NewManager returns the memory manager of cfg.
@@ -93,6 +106,71 @@ func NewManager(cfg Config) (*Manager, error) {
 // Frames returns the frames of the manager.
 func (m *Manager) Frames() *Frames {
 	return m.frames
+}
+
+// StartDMA sets the fixed DMA region of the manager, once: a run of size
+// bytes from zone z of the frames, aligned to align bytes, which o holds
+// for the life of the kernel. The region neither grows nor shrinks, and
+// from then on Give takes the DMA parts of the devices from it. The DMA
+// memory is a kind of its own: no limit of an owner counts a part. The
+// platform calls StartDMA when it knows the need of its devices, and it
+// chooses the zone that its devices reach.
+func (m *Manager) StartDMA(o *Owner, z Zone, size, align uint64) (Range, error) {
+	if size == 0 || size%FrameSize != 0 || align&(align-1) != 0 {
+		return Range{}, fmt.Errorf("memory: invalid DMA region of %d bytes with alignment %d", size, align)
+	}
+
+	m.dmaLock.Lock()
+	defer m.dmaLock.Unlock()
+
+	if m.dma.Load() != nil {
+		return Range{}, errors.New("memory: the DMA region is set already")
+	}
+
+	if o == nil {
+		return Range{}, errors.New("memory: the DMA region needs an owner")
+	}
+
+	n := size / FrameSize
+	addr, err := m.frames.AllocRun(o, z, n, max(align, FrameSize))
+
+	if err != nil {
+		return Range{}, fmt.Errorf("memory: DMA region of %d bytes: %w", size, err)
+	}
+
+	r := Range{Start: addr, End: addr + size}
+
+	if w, ok := m.inWindow(r.Start, r.End); ok {
+		m.frames.Free(o, addr, n)
+		return Range{}, fmt.Errorf("memory: the DMA region %#x-%#x lies in the window %#x-%#x", r.Start, r.End, w.Start, w.End)
+	}
+
+	words, err := Words([]Range{r}, r)
+
+	if err != nil {
+		m.frames.Free(o, addr, n)
+		return Range{}, err
+	}
+
+	f, err := New([]Range{r}, r, make([]uint64, words))
+
+	if err != nil {
+		m.frames.Free(o, addr, n)
+		return Range{}, err
+	}
+
+	m.dma.Store(&dmaRegion{frames: f, parts: NewOwner("DMA parts", 0)})
+
+	return r, nil
+}
+
+// DMAFrames returns the frames of the DMA region, or nil before StartDMA.
+func (m *Manager) DMAFrames() *Frames {
+	if d := m.dma.Load(); d != nil {
+		return d.frames
+	}
+
+	return nil
 }
 
 // Space returns the address space of the kernel.
@@ -160,192 +238,6 @@ func unmap(s AddressSpace, virt, size uint64, free func(phys, size uint64)) erro
 
 // keep is the free function of unmap for memory that stays where it is.
 func keep(phys, size uint64) {}
-
-// Buffer is DMA memory of an owner: contiguous frames, mapped 1:1 in the
-// address space of the kernel and, when the owner has a domain, at the same
-// address in its domain, so that the processor and the device use the same
-// address.
-type Buffer struct {
-	m        *Manager
-	owner    *Owner
-	domain   AddressSpace
-	addr     uint64
-	size     uint64
-	released atomic.Bool
-}
-
-// DMA gives o a DMA buffer of size bytes from the DMA region (zone DMA),
-// aligned to align bytes, filled with zeros.
-func (m *Manager) DMA(o *Owner, size, align uint64) (*Buffer, error) {
-	if size == 0 || align&(align-1) != 0 {
-		return nil, fmt.Errorf("memory: invalid DMA buffer of %d bytes with alignment %d", size, align)
-	}
-
-	n := frameCount(size)
-	addr, err := m.frames.AllocRun(o, DMA, n, max(align, FrameSize))
-
-	if err != nil {
-		return nil, err
-	}
-
-	if w, ok := m.inWindow(addr, addr+n*FrameSize); ok {
-		m.frames.Free(o, addr, n)
-		return nil, fmt.Errorf("memory: the frames %#x-%#x of the DMA buffer lie in the window %#x-%#x", addr, addr+n*FrameSize, w.Start, w.End)
-	}
-
-	b := &Buffer{m: m, owner: o, domain: o.Domain(), addr: addr, size: n * FrameSize}
-
-	if err := m.space.Map(addr, addr, b.size, Data); err != nil {
-		m.frames.Free(o, addr, n)
-		return nil, fmt.Errorf("memory: map of a DMA buffer: %w", err)
-	}
-
-	// The device sees the buffer only after the clearing.
-	clear(b.Bytes())
-
-	if b.domain != nil {
-		if err := b.domain.Map(addr, addr, b.size, Data); err != nil {
-			b.domain = nil
-			return nil, errors.Join(fmt.Errorf("memory: map of a DMA buffer in the domain: %w", err), b.Release())
-		}
-	}
-
-	if err := o.Hold(b); err != nil {
-		return nil, errors.Join(err, b.Release())
-	}
-
-	return b, nil
-}
-
-func isBuffer(p Piece) bool {
-	_, ok := p.(*Buffer)
-	return ok
-}
-
-// Addr returns the address of the buffer for the processor and the device.
-func (b *Buffer) Addr() uint64 {
-	return b.addr
-}
-
-// Size returns the size of the buffer in bytes, a multiple of FrameSize.
-func (b *Buffer) Size() uint64 {
-	return b.size
-}
-
-// Bytes returns the memory of the buffer for the processor. It is outside
-// the Go heap: the garbage collector never scans or moves it.
-func (b *Buffer) Bytes() []byte {
-	return bytesAt(b.addr, b.size)
-}
-
-func (b *Buffer) String() string {
-	return fmt.Sprintf("DMA %#x-%#x", b.addr, b.addr+b.size)
-}
-
-// Release gives the buffer back. The device must no longer use it. The
-// buffer leaves the domain first, so that the device cannot write after
-// the clearing, then it is cleared and leaves the address space of the
-// kernel, and only then its frames are free.
-func (b *Buffer) Release() error {
-	if b.released.Swap(true) {
-		return nil
-	}
-
-	defer b.owner.Drop(b)
-
-	if b.domain != nil {
-		if err := unmap(b.domain, b.addr, b.size, keep); err != nil {
-			return fmt.Errorf("memory: unmap of a DMA buffer from the domain: %w", err)
-		}
-	}
-
-	clear(b.Bytes())
-
-	return b.m.release(b.owner, b.addr, b.size)
-}
-
-// release unmaps the 1:1 range of frames of o from the address space of the
-// kernel and frees the frames, which are cleared.
-func (m *Manager) release(o *Owner, addr, size uint64) error {
-	if err := unmap(m.space, addr, size, keep); err != nil {
-		return fmt.Errorf("memory: unmap of %#x-%#x: %w", addr, addr+size, err)
-	}
-
-	m.frames.Free(o, addr, size/FrameSize)
-
-	return nil
-}
-
-// Mapping is a range of device registers of an owner, mapped 1:1 with the
-// attributes Registers.
-type Mapping struct {
-	m          *Manager
-	owner      *Owner
-	addr, size uint64
-	released   atomic.Bool
-}
-
-// MapDevice maps the device registers from phys on, size bytes, extended to
-// whole pages, for o. It refuses memory, a window, and a range that another
-// owner has mapped.
-func (m *Manager) MapDevice(o *Owner, phys, size uint64) (*Mapping, error) {
-	start, end := phys&^(FrameSize-1), alignUp(phys+size, FrameSize)
-
-	if size == 0 || end < start {
-		return nil, fmt.Errorf("memory: invalid device range %#x with %d bytes", phys, size)
-	}
-
-	for _, r := range m.memory {
-		if start < r.End && r.Start < end {
-			return nil, fmt.Errorf("memory: the device range %#x-%#x overlaps the memory %#x-%#x", start, end, r.Start, r.End)
-		}
-	}
-
-	if w, ok := m.inWindow(start, end); ok {
-		return nil, fmt.Errorf("memory: the device range %#x-%#x overlaps the window %#x-%#x", start, end, w.Start, w.End)
-	}
-
-	if err := m.space.Map(start, start, end-start, Registers); err != nil {
-		return nil, fmt.Errorf("memory: map of the device range %#x-%#x: %w", start, end, err)
-	}
-
-	mp := &Mapping{m: m, owner: o, addr: start, size: end - start}
-
-	if err := o.Hold(mp); err != nil {
-		return nil, errors.Join(err, mp.Release())
-	}
-
-	return mp, nil
-}
-
-// Addr returns the first address of the mapping, at the start of a page.
-func (mp *Mapping) Addr() uint64 {
-	return mp.addr
-}
-
-// Size returns the size of the mapping in bytes, a multiple of FrameSize.
-func (mp *Mapping) Size() uint64 {
-	return mp.size
-}
-
-func (mp *Mapping) String() string {
-	return fmt.Sprintf("registers %#x-%#x", mp.addr, mp.addr+mp.size)
-}
-
-// Release unmaps the registers.
-func (mp *Mapping) Release() error {
-	if mp.released.Swap(true) {
-		return nil
-	}
-
-	defer mp.owner.Drop(mp)
-
-	if err := unmap(mp.m.space, mp.addr, mp.size, keep); err != nil {
-		return fmt.Errorf("memory: unmap of the device range %#x-%#x: %w", mp.addr, mp.addr+mp.size, err)
-	}
-
-	return nil
-}
 
 // Region is kernel memory of an owner at virtual addresses of the window of
 // the kernel. A guard page that is never mapped lies before and after it,

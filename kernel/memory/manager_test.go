@@ -19,10 +19,9 @@ import (
 // memory of the test.
 const device = 0xfee0_0000
 
-// testManager is a Manager over 16 frames of the memory of the test, the
-// first 8 of them the DMA region, with a window of 16 pages in other
-// memory of the test, so that the clearing of buffers and regions writes
-// to real memory.
+// testManager is a Manager over 16 frames of the memory of the test, with
+// a window of 16 pages in other memory of the test, so that the clearing
+// of buffers and regions writes to real memory.
 type testManager struct {
 	*Manager
 	space  *testSpace
@@ -31,7 +30,8 @@ type testManager struct {
 	bufs   [][]byte
 }
 
-func newTestManager(t *testing.T, windows ...Range) *testManager {
+// newBareManager returns a testManager without a DMA region.
+func newBareManager(t *testing.T, windows ...Range) *testManager {
 	t.Helper()
 
 	mem, membuf := hostMemory(16)
@@ -39,7 +39,7 @@ func newTestManager(t *testing.T, windows ...Range) *testManager {
 	s := newTestSpace()
 
 	m, err := NewManager(Config{
-		Frames:  newDMAFrames(t, Range{Start: mem.Start, End: mem.Start + 8*FrameSize}, mem),
+		Frames:  newFrames(t, mem),
 		Space:   s,
 		Window:  win,
 		Memory:  []Range{mem},
@@ -51,6 +51,21 @@ func newTestManager(t *testing.T, windows ...Range) *testManager {
 	}
 
 	return &testManager{Manager: m, space: s, memory: mem, window: win, bufs: [][]byte{membuf, winbuf}}
+}
+
+// newTestManager returns a testManager whose DMA region is 8 of its
+// frames. The owner of the region is not an owner of the manager, so that
+// the tests see only their own owners.
+func newTestManager(t *testing.T) *testManager {
+	t.Helper()
+
+	tm := newBareManager(t)
+
+	if _, err := tm.StartDMA(NewOwner("DMA region", 0), zoneOf(tm.memory), 8*FrameSize, FrameSize); err != nil {
+		t.Fatal(err)
+	}
+
+	return tm
 }
 
 // expectEmpty checks that nothing is mapped, that o holds nothing and that
@@ -86,171 +101,89 @@ func TestNewManagerRefuses(t *testing.T) {
 	}
 }
 
-func TestDMA(t *testing.T) {
-	tm := newTestManager(t)
+func TestStartDMA(t *testing.T) {
+	tm := newBareManager(t)
 	defer runtime.KeepAlive(tm.bufs)
 
-	o := tm.NewOwner("driver", 0)
-	b, err := tm.DMA(o, 3*FrameSize-10, 2*FrameSize)
+	driver := tm.NewOwner("driver", 0)
+
+	if _, err := tm.Give(driver, DeviceMemory{Name: "nic", DMA: FrameSize}); err == nil {
+		t.Error("DMA part before StartDMA: no error")
+	}
+
+	region := NewOwner("DMA region", 0)
+	z := zoneOf(tm.memory)
+
+	for _, c := range []struct{ size, align uint64 }{{0, FrameSize}, {FrameSize + 1, FrameSize}, {FrameSize, 3 * FrameSize}, {17 * FrameSize, FrameSize}} {
+		if _, err := tm.StartDMA(region, z, c.size, c.align); err == nil {
+			t.Errorf("DMA region of %d bytes aligned to %d: no error", c.size, c.align)
+		}
+	}
+
+	if region.Bytes() != 0 || tm.DMAFrames() != nil {
+		t.Fatalf("after refused regions: %v, DMA frames %v", region, tm.DMAFrames())
+	}
+
+	r, err := tm.StartDMA(region, z, 4*FrameSize, 4*FrameSize)
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if b.Size() != 3*FrameSize || b.Addr()%(2*FrameSize) != 0 || len(b.Bytes()) != 3*FrameSize {
-		t.Fatalf("buffer %v: size %d", b, b.Size())
+	if r.End-r.Start != 4*FrameSize || r.Start%(4*FrameSize) != 0 || r.Start < tm.memory.Start || r.End > tm.memory.End || region.Bytes() != 4*FrameSize {
+		t.Fatalf("region %#x-%#x, %v", r.Start, r.End, region)
 	}
 
-	if !zero(b.Bytes()) {
-		t.Error("new DMA buffer not cleared")
+	if total, free := tm.DMAFrames().Usage(DMA); total != 4*FrameSize || free != 4*FrameSize {
+		t.Errorf("DMA frames: %d bytes, %d free; want 4 frames free", total, free)
 	}
 
-	for virt := b.Addr(); virt < b.Addr()+b.Size(); virt += FrameSize {
-		if phys, attr, ok := tm.space.Lookup(virt); !ok || phys != virt || attr != Data {
-			t.Errorf("%#x: got %#x, %#x, %v; want 1:1 Data", virt, phys, attr, ok)
+	if _, err := tm.StartDMA(region, z, FrameSize, FrameSize); err == nil {
+		t.Error("second DMA region: no error")
+	}
+
+	// The parts come only from the region, and it does not grow.
+	part := DeviceMemory{Name: "nic", DMA: FrameSize}
+
+	for range 4 {
+		g, err := tm.Give(driver, part)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if dev, _, _ := g.Part(); dev < r.Start || dev >= r.End {
+			t.Errorf("part %v outside the region", g)
 		}
 	}
 
-	if o.Bytes() != 3*FrameSize || len(o.Pieces()) != 1 || o.Pieces()[0] != b {
-		t.Fatalf("%v: pieces %v", o, o.Pieces())
+	if _, err := tm.Give(driver, part); !errors.Is(err, ErrNoMemory) {
+		t.Errorf("part in a full region: got %v, want %v", err, ErrNoMemory)
 	}
 
-	data := b.Bytes()
-	data[0], data[len(data)-1] = 0xab, 0xcd
-
-	if err := b.Release(); err != nil {
+	if err := driver.End(); err != nil {
 		t.Fatal(err)
 	}
 
-	if !zero(data) {
-		t.Error("released DMA buffer not cleared")
-	}
-
-	tm.expectEmpty(t, o)
-
-	if err := b.Release(); err != nil {
-		t.Errorf("second Release: %v", err)
-	}
-
-	for _, c := range []struct{ size, align uint64 }{{0, FrameSize}, {FrameSize, 3 * FrameSize}} {
-		if _, err := tm.DMA(o, c.size, c.align); err == nil {
-			t.Errorf("DMA of %d bytes aligned to %d: no error", c.size, c.align)
-		}
+	if _, free := tm.DMAFrames().Usage(DMA); free != 4*FrameSize || region.Bytes() != 4*FrameSize {
+		t.Errorf("after End: %d bytes free, %v", free, region)
 	}
 }
 
-func TestDMADomain(t *testing.T) {
-	tm := newTestManager(t)
-	defer runtime.KeepAlive(tm.bufs)
-
-	o := tm.NewOwner("driver", 0)
-	domain := newTestSpace()
-
-	if err := o.SetDomain(domain); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := o.SetDomain(newTestSpace()); err == nil {
-		t.Error("second domain: no error")
-	}
-
-	b, err := tm.DMA(o, FrameSize, FrameSize)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if phys, attr, ok := domain.Lookup(b.Addr()); !ok || phys != b.Addr() || attr != Data {
-		t.Errorf("domain: got %#x, %#x, %v; want 1:1 Data", phys, attr, ok)
-	}
-
-	if err := b.Release(); err != nil {
-		t.Fatal(err)
-	}
-
-	if mapped, waiting := domain.pages(); mapped != 0 || waiting != 0 || domain.flushes != 1 {
-		t.Errorf("domain after Release: %d mapped, %d waiting, %d flushes", mapped, waiting, domain.flushes)
-	}
-
-	tm.expectEmpty(t, o)
-
-	// A failed map in the domain gives everything back.
-	domain.fail = errors.New("test: domain full")
-
-	if _, err := tm.DMA(o, FrameSize, FrameSize); err == nil {
-		t.Fatal("DMA with a failed map in the domain: no error")
-	}
-
-	tm.expectEmpty(t, o)
-
-	// The domain must come before the first buffer.
-	other := tm.NewOwner("other driver", 0)
-
-	if _, err := tm.DMA(other, FrameSize, FrameSize); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := other.SetDomain(newTestSpace()); err == nil {
-		t.Error("domain after a DMA buffer: no error")
-	}
-}
-
-func TestDMARefusesWindow(t *testing.T) {
+func TestStartDMARefusesWindow(t *testing.T) {
 	// The window of the Go memory lies on all memory of the manager.
-	tm := newTestManager(t, Range{Start: 0, End: 1 << 47})
+	tm := newBareManager(t, Range{Start: 0, End: 1 << 47})
 	defer runtime.KeepAlive(tm.bufs)
 
-	o := tm.NewOwner("driver", 0)
+	region := NewOwner("DMA region", 0)
 
-	if _, err := tm.DMA(o, FrameSize, FrameSize); err == nil {
-		t.Fatal("DMA buffer in a window: no error")
+	if _, err := tm.StartDMA(region, zoneOf(tm.memory), FrameSize, FrameSize); err == nil {
+		t.Fatal("DMA region in a window: no error")
 	}
 
-	tm.expectEmpty(t, o)
-}
-
-func TestMapDevice(t *testing.T) {
-	tm := newTestManager(t)
-	defer runtime.KeepAlive(tm.bufs)
-
-	o := tm.NewOwner("driver", 0)
-	mp, err := tm.MapDevice(o, device+0x10, FrameSize)
-
-	if err != nil {
-		t.Fatal(err)
+	if region.Bytes() != 0 || tm.DMAFrames() != nil {
+		t.Errorf("after the refusal: %v, DMA frames %v", region, tm.DMAFrames())
 	}
-
-	if mp.Addr() != device || mp.Size() != 2*FrameSize {
-		t.Fatalf("%v: want the two pages from %#x", mp, device)
-	}
-
-	if phys, attr, ok := tm.space.Lookup(device + FrameSize); !ok || phys != device+FrameSize || attr != Registers {
-		t.Errorf("got %#x, %#x, %v; want 1:1 Registers", phys, attr, ok)
-	}
-
-	if _, err := tm.MapDevice(tm.NewOwner("other driver", 0), device, FrameSize); err == nil {
-		t.Error("device mapped twice: no error")
-	}
-
-	for _, c := range []struct {
-		name       string
-		phys, size uint64
-	}{
-		{"memory", tm.memory.Start + FrameSize, 1},
-		{"window", tm.window.End - 1, 2},
-		{"no bytes", device, 0},
-		{"wrap", ^uint64(0) - FrameSize, 2 * FrameSize},
-	} {
-		if _, err := tm.MapDevice(o, c.phys, c.size); err == nil {
-			t.Errorf("%s: no error", c.name)
-		}
-	}
-
-	if err := mp.Release(); err != nil {
-		t.Fatal(err)
-	}
-
-	tm.expectEmpty(t, o)
 }
 
 func TestAlloc(t *testing.T) {
@@ -335,12 +268,9 @@ func TestOwnerEnd(t *testing.T) {
 	defer runtime.KeepAlive(tm.bufs)
 
 	o := tm.NewOwner("driver", 0)
+	nic := DeviceMemory{Name: "nic", Registers: []Range{{Start: device, End: device + FrameSize}}, DMA: FrameSize}
 
-	if _, err := tm.DMA(o, FrameSize, FrameSize); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := tm.MapDevice(o, device, FrameSize); err != nil {
+	if _, err := tm.Give(o, nic); err != nil {
 		t.Fatal(err)
 	}
 
@@ -348,7 +278,7 @@ func TestOwnerEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !slices.Contains(tm.Owners(), o) || len(o.Pieces()) != 3 {
+	if !slices.Contains(tm.Owners(), o) || len(o.Pieces()) != 2 {
 		t.Fatalf("%v: pieces %v", o, o.Pieces())
 	}
 
@@ -367,12 +297,8 @@ func TestOwnerEnd(t *testing.T) {
 	}
 
 	// An ended owner takes no new piece.
-	if _, err := tm.DMA(o, FrameSize, FrameSize); !errors.Is(err, ErrEnded) {
-		t.Errorf("DMA after End: got %v, want %v", err, ErrEnded)
-	}
-
-	if _, err := tm.MapDevice(o, device, FrameSize); !errors.Is(err, ErrEnded) {
-		t.Errorf("MapDevice after End: got %v, want %v", err, ErrEnded)
+	if _, err := tm.Give(o, nic); !errors.Is(err, ErrEnded) {
+		t.Errorf("Give after End: got %v, want %v", err, ErrEnded)
 	}
 
 	if _, err := tm.Alloc(o, FrameSize); !errors.Is(err, ErrEnded) {
@@ -381,6 +307,10 @@ func TestOwnerEnd(t *testing.T) {
 
 	if err := o.SetDomain(newTestSpace()); !errors.Is(err, ErrEnded) {
 		t.Errorf("SetDomain after End: got %v, want %v", err, ErrEnded)
+	}
+
+	if err := o.SetSpace(newTestSpace(), Range{Start: process, End: process + gib}); !errors.Is(err, ErrEnded) {
+		t.Errorf("SetSpace after End: got %v, want %v", err, ErrEnded)
 	}
 
 	tm.expectEmpty(t, o)
@@ -465,7 +395,7 @@ func TestOwnerChildren(t *testing.T) {
 	}
 
 	// The children share the limit of the parent.
-	if _, err := tm.DMA(driver, 3*FrameSize, FrameSize); err != nil {
+	if _, err := tm.Alloc(driver, 3*FrameSize); err != nil {
 		t.Fatal(err)
 	}
 

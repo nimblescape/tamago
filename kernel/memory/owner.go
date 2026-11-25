@@ -20,13 +20,13 @@ import (
 var ErrEnded = errors.New("memory: the owner has ended")
 
 // Piece is something that an owner holds from a manager of the kernel,
-// besides its frames: a DMA buffer, the registers of a device, a region of
-// kernel memory, and later an interrupt vector, a device function or an
-// IOMMU domain. The manager that gives out a piece records it with Hold and
+// besides its frames: a device with its registers and its DMA part, a
+// region of kernel memory, a child owner, and later an interrupt vector or
+// an IOMMU domain. The manager that gives out a piece records it with Hold and
 // takes it back in Release.
 type Piece interface {
 	// String describes the piece for the diagnostics, for example
-	// "DMA 0x7f000000-0x7f004000".
+	// "device nic: registers 0xfe000000-0xfe004000".
 	String() string
 	// Release gives the piece back to its manager, which clears it. A
 	// second call does nothing and returns nil.
@@ -54,6 +54,8 @@ type Owner struct {
 	lock   sync.Mutex
 	pieces []Piece
 	domain AddressSpace
+	space  AddressSpace // the own address space of the owner, or nil
+	window *Window      // the window of space for the devices
 	ended  bool
 	// manager is the manager that lists the owner, or nil.
 	manager *Manager
@@ -133,10 +135,10 @@ func (o *Owner) String() string {
 	return fmt.Sprintf("%q holds %d KiB of frames (%s) and %d other pieces", o.name, o.Bytes()>>10, limit, n)
 }
 
-// SetDomain gives the owner the DMA address space of its device (an IOMMU
-// domain). Every DMA buffer of the owner is then also mapped there, at the
-// address that the processor uses. It is set once, before the first DMA
-// buffer.
+// SetDomain gives the owner the DMA address space of its devices (an IOMMU
+// domain). The DMA part of each device of the owner is then also mapped
+// there, at its physical address, and the device reaches nothing else. It
+// is set once, before the first device.
 func (o *Owner) SetDomain(d AddressSpace) error {
 	o.lock.Lock()
 	defer o.lock.Unlock()
@@ -146,8 +148,8 @@ func (o *Owner) SetDomain(d AddressSpace) error {
 		return ErrEnded
 	case o.domain != nil:
 		return errors.New("memory: the owner has a domain already")
-	case slices.ContainsFunc(o.pieces, isBuffer):
-		return errors.New("memory: the owner holds DMA buffers already")
+	case slices.ContainsFunc(o.pieces, isGrant):
+		return errors.New("memory: the owner holds a device already")
 	}
 
 	o.domain = d
@@ -161,6 +163,62 @@ func (o *Owner) Domain() AddressSpace {
 	defer o.lock.Unlock()
 
 	return o.domain
+}
+
+// SetSpace gives the owner an address space of its own, such as the one of
+// a process: the processor of the owner then reaches its devices at
+// addresses of window in s, instead of 1:1 in the address space of the
+// kernel. It is set once, before the first device.
+func (o *Owner) SetSpace(s AddressSpace, window Range) error {
+	if s == nil {
+		return errors.New("memory: no address space")
+	}
+
+	w, err := NewWindow(window)
+
+	if err != nil {
+		return err
+	}
+
+	o.lock.Lock()
+	defer o.lock.Unlock()
+
+	switch {
+	case o.ended:
+		return ErrEnded
+	case o.space != nil:
+		return errors.New("memory: the owner has an address space already")
+	case slices.ContainsFunc(o.pieces, isGrant):
+		return errors.New("memory: the owner holds a device already")
+	}
+
+	o.space, o.window = s, w
+
+	return nil
+}
+
+// view returns the address space of the processor of the owner with its
+// window, and the domain of the owner. The address space is the own one of
+// the owner, else the one of its nearest parent that has one, such as the
+// process that runs a driver, else nil for the address space of the
+// kernel. The domain is never inherited: each driver owns its own.
+func (o *Owner) view() (space AddressSpace, window *Window, domain AddressSpace) {
+	o.lock.Lock()
+	domain = o.domain
+	o.lock.Unlock()
+
+	for p := o; p != nil && space == nil; p = p.parent {
+		p.lock.Lock()
+		space, window = p.space, p.window
+		p.lock.Unlock()
+	}
+
+	return space, window, domain
+}
+
+func isGrant(p Piece) bool {
+	_, ok := p.(*Grant)
+	return ok
 }
 
 // Hold records that the owner holds p. It returns ErrEnded, and records
