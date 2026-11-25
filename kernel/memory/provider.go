@@ -56,8 +56,13 @@ type ProviderConfig struct {
 // it through its mapping and every core forgot the mapping. So no data of
 // the runtime stays in a free frame.
 //
-// The runtime calls a Provider with its locks held. So its methods never
-// allocate, and a lack of frames is fatal, as on every system.
+// The runtime calls a Provider with its locks held, and also at times at
+// which it allows no write barrier, such as while the garbage collector
+// takes the pointers out of the buffer of the write barriers. So its
+// methods, and the Mapper and Flush that they call, never allocate and
+// never write a pointer outside the stack, which needs a write barrier.
+// TestNoWriteBarrier checks this for this package and for package
+// amd64/paging. A lack of frames is fatal, as on every system.
 type Provider struct {
 	space  *Space
 	frames *Frames

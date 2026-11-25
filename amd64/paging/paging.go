@@ -388,32 +388,40 @@ func (s *Space) unmapped(level int, addr, base, start, end uint64) bool {
 
 // mapRange maps the range from start to end, which is free, to the
 // physical memory at offset off from it.
+//
+// mapRange goes through the entries itself and does not use walk: a
+// closure would write the error through a pointer, with a write barrier,
+// and the Go runtime maps its memory through Map (kernel/memory) also at
+// times at which it allows no write barrier.
 func (s *Space) mapRange(level int, addr, base, start, end, off, f uint64) error {
-	var err error
+	span := spans[level]
+	table := s.mem.Table(addr)
 
-	s.walk(level, addr, base, start, end, func(p *uint64, eStart, lo, hi uint64) bool {
-		span := spans[level]
+	for i := (start - base) / span; i < entries && base+i*span < end; i++ {
+		p := &table[i]
+		eStart := base + i*span
+		lo, hi := max(start, eStart), min(end, eStart+span)
 
 		if lo == eStart && hi == eStart+span && s.leafAllowed(level) && (lo+off)%span == 0 {
 			if !atomic.CompareAndSwapUint64(p, 0, leaf(level, lo+off, f)) {
-				err = ErrMapped
+				return ErrMapped
 			}
 
-			return err == nil
+			continue
 		}
 
-		var sub uint64
+		sub, err := s.table(level, p)
 
-		if sub, err = s.table(level, p); err != nil {
-			return false
+		if err != nil {
+			return err
 		}
 
-		err = s.mapRange(level+1, sub, eStart, lo, hi, off, f)
+		if err := s.mapRange(level+1, sub, eStart, lo, hi, off, f); err != nil {
+			return err
+		}
+	}
 
-		return err == nil
-	})
-
-	return err
+	return nil
 }
 
 // table returns the table that the entry at p of the level points to, and
