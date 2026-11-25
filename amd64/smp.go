@@ -51,6 +51,10 @@ const (
 	// AP applies
 	patAddress = 0x6050
 
+	// taskAPICAddress holds the APIC ID of the AP that takes the task,
+	// 32 bits (see [CPU.Task])
+	taskAPICAddress = 0x6058
+
 	// The far return to Long Mode in ·apinit pushes the same values on
 	// every AP, so all APs share the stack that ends here.
 	sharedStackAddress = 0x6100
@@ -111,6 +115,11 @@ const (
 // The runtime may call Task on several processors at once, and all APs
 // share one task structure. So Task holds a lock and returns only when
 // the AP has taken the task.
+//
+// The task names its AP by the APIC ID, and only that AP takes it. The
+// waiting APs take interrupts, so any of them may wake while the task
+// waits. If such an AP took the task, the AP that Task signals would
+// keep waiting, and a later Task would signal an AP that already runs.
 func (cpu *CPU) Task(sp, mp, _, fn unsafe.Pointer) {
 	if sp == nil || mp == nil {
 		return
@@ -133,7 +142,9 @@ func (cpu *CPU) Task(sp, mp, _, fn unsafe.Pointer) {
 
 	cpu.init += 1
 
-	// the AP reads pc first, therefore pc is written last
+	// The AP reads the APIC ID first and then pc, so the APIC ID is
+	// written first and pc last.
+	reg.Write(taskAPICAddress, uint32(apicid))
 	reg.Write64(taskSP, uint64(uintptr(sp)))
 	reg.Write64(taskMP, uint64(uintptr(mp)))
 	reg.Write64(taskPC, uint64(uintptr(fn)))
@@ -146,6 +157,7 @@ func (cpu *CPU) Task(sp, mp, _, fn unsafe.Pointer) {
 		now := cpu.GetTime()
 
 		if now-start > int64(apLimit) {
+			print("AP with APIC ID ", apicid, " does not take its task\n")
 			panic("AP does not take its task")
 		}
 
@@ -349,6 +361,7 @@ func (cpu *CPU) prepareAPs() {
 	reg.Write64(taskSP, 0)
 	reg.Write64(taskMP, 0)
 	reg.Write64(taskPC, 0)
+	reg.Write(taskAPICAddress, noAPIC)
 
 	// read fresh CR3 as a cpuinit override might have overridden ours,
 	// the APs load it in 16-bit mode

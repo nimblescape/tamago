@@ -225,6 +225,16 @@ wait:
 	HLT
 	CLI
 
+	// Take only the task that names this AP: an interrupt may wake any
+	// waiting AP. The APIC ID comes first: CPU.Task writes it before the
+	// task and pc last, and it writes no new task before the AP clears
+	// pc. So when the APIC ID matches, a pc that is not 0 belongs to the
+	// task of this AP.
+	LAPIC_ID_AX
+	MOVQ	$(const_taskAPICAddress), BX
+	CMPL	AX, (BX)
+	JNE	wait
+
 	MOVQ	$(const_taskAddress), AX
 	MOVQ	task_pc(AX), R12
 	CMPQ	R12, $0
