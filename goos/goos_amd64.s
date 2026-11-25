@@ -13,3 +13,6 @@ TEXT ·CPUInit(SB),NOSPLIT|NOFRAME,$0
 
 TEXT ·RaiseEvent(SB),NOSPLIT|NOFRAME,$0-4
 	JMP	runtime·eventRaise(SB)
+
+TEXT ·PreemptInterrupt(SB),NOSPLIT|NOFRAME,$0
+	JMP	runtime·preemptInterrupt(SB)

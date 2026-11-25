@@ -189,8 +189,19 @@ func (cpu *CPU) SetTime(ns int64) {
 // nanoseconds value, an interrupt (see [IRQ_WAKEUP] is generated on
 // expiration. The timer is enabled only on [CPU] instances supporting
 // [Features.TSCDeadline].
+//
+// While preemption is on (see [CPU.EnablePreemption]), the timer raises
+// [IRQ_PREEMPT], and SetAlarm only resumes halted processors when the
+// argument is zero.
 func (cpu *CPU) SetAlarm(ns int64) {
 	if cpu.TimerMultiplier == 0 || !cpu.features.TSCDeadline {
+		return
+	}
+
+	if preemptTicks != 0 {
+		if ns == 0 {
+			cpu.LAPIC.IPI(0, IRQ_KICK, lapic.ICR_DST_REST|lapic.ICR_DLV_IRQ)
+		}
 		return
 	}
 
