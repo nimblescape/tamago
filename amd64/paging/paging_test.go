@@ -22,9 +22,9 @@ const (
 
 var errFull = errors.New("test: no table memory")
 
-// memory gives tables from a map, and fails after limit tables when limit
+// heapTables gives tables from a map, and fails after limit tables when limit
 // is not 0.
-type memory struct {
+type heapTables struct {
 	mu     sync.Mutex
 	tables map[uint64]*[entries]uint64
 	next   uint64
@@ -33,11 +33,11 @@ type memory struct {
 	frees  int
 }
 
-func newMemory() *memory {
-	return &memory{tables: map[uint64]*[entries]uint64{}, next: 0x10_0000}
+func newHeapTables() *heapTables {
+	return &heapTables{tables: map[uint64]*[entries]uint64{}, next: 0x10_0000}
 }
 
-func (m *memory) Alloc() (uint64, error) {
+func (m *heapTables) Alloc() (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -53,7 +53,7 @@ func (m *memory) Alloc() (uint64, error) {
 	return addr, nil
 }
 
-func (m *memory) Free(addr uint64) {
+func (m *heapTables) Free(addr uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -61,7 +61,7 @@ func (m *memory) Free(addr uint64) {
 	m.frees++
 }
 
-func (m *memory) Table(addr uint64) *[entries]uint64 {
+func (m *heapTables) Table(addr uint64) *[entries]uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -74,10 +74,10 @@ func (m *memory) Table(addr uint64) *[entries]uint64 {
 	return t
 }
 
-func newSpace(t testing.TB, giant bool) (*Space, *memory) {
+func newSpace(t testing.TB, giant bool) (*Space, *heapTables) {
 	t.Helper()
 
-	m := newMemory()
+	m := newHeapTables()
 	s, err := New(m, giant)
 
 	if err != nil {
@@ -413,4 +413,92 @@ func TestUndoKeepsOtherPages(t *testing.T) {
 
 	expectNone(t, s, gib)
 	expect(t, s, gib+4*kib, 5*gib, Memory, 4*kib)
+}
+
+// TestMapIntoOldTable checks that a large page whose entry still points to
+// the table of an earlier mapping maps into that table.
+func TestMapIntoOldTable(t *testing.T) {
+	s, m := newSpace(t, false)
+	free := func(phys, size uint64) {}
+
+	if err := s.Map(gib, 9*gib, 4*kib, Memory); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Unmap(gib, 4*kib); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Reclaim(gib, 4*kib, free); err != nil {
+		t.Fatal(err)
+	}
+
+	tables := m.allocs
+
+	if err := s.Map(gib, 10*gib, 2*mib, Memory); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.allocs != tables {
+		t.Errorf("Map made %d new tables, want none", m.allocs-tables)
+	}
+
+	expect(t, s, gib, 10*gib, Memory, 4*kib)
+	expect(t, s, gib+2*mib-4*kib, 10*gib+2*mib-4*kib, Memory, 4*kib)
+	expectNone(t, s, gib+2*mib)
+}
+
+func TestPrepare(t *testing.T) {
+	s, m := newSpace(t, false)
+
+	// A PDPT and four page directories for the first 4 GiB.
+	if err := s.Prepare(0, 4*gib, 2*mib); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.allocs != 6 {
+		t.Fatalf("Prepare made %d tables with the root, want 6", m.allocs)
+	}
+
+	p := s.Prepared()
+
+	if err := p.Map(3*gib, 3*gib, 4*mib, Memory); err != nil {
+		t.Fatal(err)
+	}
+
+	expect(t, s, 3*gib+2*mib, 3*gib+2*mib, Memory, 2*mib)
+
+	// A page of 4 KiB needs a page table, and so does a page beyond
+	// the prepared range.
+	if err := p.Map(3*gib+8*mib, 3*gib+8*mib, 4*kib, Memory); !errors.Is(err, ErrNoTable) {
+		t.Errorf("small page: got %v, want %v", err, ErrNoTable)
+	}
+
+	if err := p.Map(4*gib, 4*gib, 2*mib, Memory); !errors.Is(err, ErrNoTable) {
+		t.Errorf("beyond the prepared range: got %v, want %v", err, ErrNoTable)
+	}
+
+	if m.allocs != 6 {
+		t.Errorf("Prepared made %d new tables", m.allocs-6)
+	}
+
+	expectNone(t, s, 3*gib+8*mib)
+	expectNone(t, s, 4*gib)
+
+	// Prepare again makes nothing new.
+	if err := s.Prepare(2*gib, gib, 2*mib); err != nil || m.allocs != 6 {
+		t.Errorf("second Prepare: %v, %d tables", err, m.allocs)
+	}
+
+	for _, c := range []struct{ virt, size, span uint64 }{
+		{0, 4 * gib, 4 * mib},
+		{0, 4 * gib, 512 * gib},
+		{mib, 2 * mib, 2 * mib},
+		{0, 3 * mib, 2 * mib},
+		{0, 0, 2 * mib},
+	} {
+		if err := s.Prepare(c.virt, c.size, c.span); !errors.Is(err, ErrRange) {
+			t.Errorf("Prepare(%#x, %#x, %#x): got %v, want %v", c.virt, c.size, c.span, err, ErrRange)
+		}
+	}
 }

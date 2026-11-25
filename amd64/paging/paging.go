@@ -28,6 +28,11 @@
 //
 // Map refuses a range in which any page is still waiting for Reclaim.
 //
+// Table memory that a kernel reaches only through these tables, without a
+// map of all memory, makes each new table reachable with a Map. So that
+// such a Map never needs a table itself, Prepare makes the tables of a
+// range in advance, and Prepared maps only into tables that exist.
+//
 // AMD64 Architecture Programmer's Manual, volume 2, section 5.3 (long-mode
 // page translation) and section 5.4 (page-translation-table entry fields).
 //
@@ -105,6 +110,9 @@ var (
 	// ErrAlign means that the physical address does not fit the page
 	// size that the range needs.
 	ErrAlign = errors.New("paging: physical address not aligned")
+	// ErrNoTable means that a mapping of a prepared address space needs a
+	// table that does not exist (see Space.Prepared).
+	ErrNoTable = errors.New("paging: no prepared table")
 )
 
 // TableMemory gives the tables their memory.
@@ -142,6 +150,73 @@ func New(mem TableMemory, giant bool) (*Space, error) {
 // Root returns the address of the page map level 4, the value for CR3.
 func (s *Space) Root() uint64 {
 	return s.root
+}
+
+// Prepare makes every table of the range of size bytes from virt on down to
+// the level whose entries cover span bytes, so that a page of span bytes
+// or more, at an address that is a multiple of span, maps into the range
+// without a new table. span is 1 GiB, 2 MiB or 4 KiB, and virt and size
+// are multiples of it. When the memory for a table runs out, the tables
+// that Prepare made stay, and it returns the error of TableMemory.
+func (s *Space) Prepare(virt, size, span uint64) error {
+	if err := checkRange(virt, size); err != nil {
+		return err
+	}
+
+	last := 1
+
+	for last < len(spans) && spans[last] != span {
+		last++
+	}
+
+	if last == len(spans) || virt%span != 0 || size%span != 0 {
+		return ErrRange
+	}
+
+	return s.prepare(0, s.root, 0, virt, virt+size, last)
+}
+
+// prepare makes the tables of the levels before last for the range from
+// start to end.
+func (s *Space) prepare(level int, addr, base, start, end uint64, last int) error {
+	span := spans[level]
+	table := s.mem.Table(addr)
+
+	for i := (start - base) / span; i < entries && base+i*span < end; i++ {
+		eStart := base + i*span
+		sub, err := s.table(level, &table[i])
+
+		if err != nil {
+			return err
+		}
+
+		if level+1 == last {
+			continue
+		}
+
+		if err := s.prepare(level+1, sub, eStart, max(start, eStart), min(end, eStart+span), last); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Prepared returns the same address space with one difference: a change
+// that needs a new table fails with ErrNoTable. Table memory maps its new
+// tables through it into a range that Prepare made, so that it never needs
+// a table for a table.
+func (s *Space) Prepared() *Space {
+	return &Space{mem: noTables{s.mem}, root: s.root, giant: s.giant}
+}
+
+// noTables is table memory that gives no new table.
+type noTables struct {
+	TableMemory
+}
+
+func (noTables) Alloc() (uint64, error) {
+	return 0, ErrNoTable
 }
 
 // Map maps size bytes from virt on to the physical memory from phys on
@@ -387,7 +462,9 @@ func (s *Space) unmapped(level int, addr, base, start, end uint64) bool {
 }
 
 // mapRange maps the range from start to end, which is free, to the
-// physical memory at offset off from it.
+// physical memory at offset off from it. An entry that covers a part of
+// the range whole gets a large page, unless it still points to a table
+// from an earlier mapping: the pages then go into that table.
 //
 // mapRange goes through the entries itself and does not use walk: a
 // closure would write the error through a pointer, with a write barrier,
@@ -402,11 +479,8 @@ func (s *Space) mapRange(level int, addr, base, start, end, off, f uint64) error
 		eStart := base + i*span
 		lo, hi := max(start, eStart), min(end, eStart+span)
 
-		if lo == eStart && hi == eStart+span && s.leafAllowed(level) && (lo+off)%span == 0 {
-			if !atomic.CompareAndSwapUint64(p, 0, leaf(level, lo+off, f)) {
-				return ErrMapped
-			}
-
+		if lo == eStart && hi == eStart+span && s.leafAllowed(level) && (lo+off)%span == 0 &&
+			atomic.CompareAndSwapUint64(p, 0, leaf(level, lo+off, f)) {
 			continue
 		}
 

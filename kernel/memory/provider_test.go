@@ -8,99 +8,11 @@
 
 package memory
 
-import (
-	"errors"
-	"sync"
-	"testing"
-)
-
-// mapper keeps the pages of an address space in maps. A page that Unmap
-// unmapped waits in unmapped until Reclaim.
-type mapper struct {
-	mu       sync.Mutex
-	mapped   map[uint64]uint64
-	unmapped map[uint64]uint64
-	flushes  int
-}
-
-func newMapper() *mapper {
-	return &mapper{mapped: map[uint64]uint64{}, unmapped: map[uint64]uint64{}}
-}
-
-func (m *mapper) Map(virt, phys, size uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for off := uint64(0); off < size; off += FrameSize {
-		if _, ok := m.mapped[virt+off]; ok {
-			return errors.New("test: page mapped twice")
-		}
-
-		m.mapped[virt+off] = phys + off
-	}
-
-	return nil
-}
-
-func (m *mapper) Unmap(virt, size uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for off := uint64(0); off < size; off += FrameSize {
-		phys, ok := m.mapped[virt+off]
-
-		if !ok {
-			return errors.New("test: unmap of a page that is not mapped")
-		}
-
-		delete(m.mapped, virt+off)
-		m.unmapped[virt+off] = phys
-	}
-
-	return nil
-}
-
-func (m *mapper) Reclaim(virt, size uint64, free func(phys, size uint64)) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.flushes == 0 {
-		return errors.New("test: reclaim before a flush")
-	}
-
-	for off := uint64(0); off < size; off += FrameSize {
-		if _, ok := m.mapped[virt+off]; ok {
-			return errors.New("test: reclaim of a mapped page")
-		}
-
-		if phys, ok := m.unmapped[virt+off]; ok {
-			delete(m.unmapped, virt+off)
-			free(phys, FrameSize)
-		}
-	}
-
-	return nil
-}
-
-func (m *mapper) Mapped(virt uint64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	_, ok := m.mapped[virt]
-
-	return ok
-}
-
-func (m *mapper) flush() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.flushes++
-}
+import "testing"
 
 // testProvider returns a provider with a window of 64 pages over 16 frames
 // above 4 GiB, and records what it clears.
-func testProvider(t *testing.T, limit uint64) (*Provider, *mapper, *Owner, *[]Range) {
+func testProvider(t *testing.T, limit uint64) (*Provider, *testSpace, *Owner, *[]Range) {
 	t.Helper()
 
 	ranges := []Range{{Start: 8 * gib, End: 8*gib + 16*FrameSize}}
@@ -116,7 +28,7 @@ func testProvider(t *testing.T, limit uint64) (*Provider, *mapper, *Owner, *[]Ra
 		t.Fatal(err)
 	}
 
-	m := newMapper()
+	m := newTestSpace()
 	owner := NewOwner("Go heap", limit)
 
 	p, err := NewProvider(ProviderConfig{
@@ -124,8 +36,7 @@ func testProvider(t *testing.T, limit uint64) (*Provider, *mapper, *Owner, *[]Ra
 		Frames: frames,
 		Owner:  owner,
 		Zone:   High,
-		Mapper: m,
-		Flush:  m.flush,
+		Space:  m,
 	})
 
 	if err != nil {
@@ -159,6 +70,12 @@ func TestProviderUse(t *testing.T) {
 
 	if len(m.mapped) != 4 || owner.Bytes() != 4*FrameSize {
 		t.Errorf("%d pages mapped, owner has %d bytes; want 4 pages", len(m.mapped), owner.Bytes())
+	}
+
+	for virt, pg := range m.mapped {
+		if pg.attr != Data {
+			t.Errorf("page %#x mapped with %#x, want Data", virt, pg.attr)
+		}
 	}
 
 	if len(*cleared) != 4 {
@@ -246,8 +163,8 @@ func TestProviderNoAllocation(t *testing.T) {
 	p, m, _, _ := testProvider(t, 0)
 
 	// The test mapper allocates in its maps; count only the provider.
-	m.mapped = make(map[uint64]uint64, 64)
-	m.unmapped = make(map[uint64]uint64, 64)
+	m.mapped = make(map[uint64]page, 64)
+	m.unmapped = make(map[uint64]page, 64)
 	p.clear = func(_, _ uint64) {}
 
 	addr := p.Reserve(0, 8*FrameSize, FrameSize)

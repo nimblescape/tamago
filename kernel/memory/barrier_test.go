@@ -21,24 +21,45 @@ import (
 	"testing"
 )
 
-// constructors may write pointers with a write barrier: the runtime never
-// calls them through a Provider.
-var constructors = map[string]bool{
-	"New":         true,
-	"NewOwner":    true,
-	"NewProvider": true,
-	"NewTables":   true,
-	"split":       true,
+// offPath are the functions, and the types with all their methods, that
+// the runtime never calls through a Provider, so they may write pointers
+// with a write barrier: the constructors, the managers of the kernel with
+// their pieces, the pieces of an owner, and package initialization.
+var offPath = map[string]bool{
+	"New":             true,
+	"NewAddressSpace": true,
+	"NewManager":      true,
+	"NewOwner":        true,
+	"NewProvider":     true,
+	"NewTables":       true,
+	"split":           true,
+	"Manager":         true,
+	"Buffer":          true,
+	"Mapping":         true,
+	"Region":          true,
+	"Owner.SetDomain": true,
+	"Owner.Hold":      true,
+	"Owner.Drop":      true,
+	"Owner.End":       true,
+	"Owner.Pieces":    true,
+	"Tables.Reach":    true,
+	"Space.Prepared":  true,
+	"remove":          true,
+	"init":            true,
 }
 
 var writeBarrier = regexp.MustCompile(`^(.+\.go):(\d+):\d+: write barrier$`)
 
 // TestNoWriteBarrier compiles this package and package amd64/paging with
 // the compiler flag -d=wb, which reports every write barrier, and fails for
-// each one outside the constructors (see Provider).
+// each one outside offPath (see Provider). The build turns inlining off,
+// so that the compiler reports each write barrier in the function that
+// holds it. A write barrier in the code of another package, such as an
+// instance of a generic function, cannot be traced to a function of these
+// packages, so it fails too.
 func TestNoWriteBarrier(t *testing.T) {
 	gotool := filepath.Join(runtime.GOROOT(), "bin", "go")
-	cmd := exec.Command(gotool, "build", "-gcflags=-d=wb", ".", "../../amd64/paging")
+	cmd := exec.Command(gotool, "build", "-gcflags=-d=wb -l", ".", "../../amd64/paging")
 	out, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -55,6 +76,11 @@ func TestNoWriteBarrier(t *testing.T) {
 			continue
 		}
 
+		if !strings.HasPrefix(m[1], "./") && !strings.HasPrefix(m[1], "../../amd64/paging/") {
+			t.Errorf("%s: write barrier in the code of another package", m[1])
+			continue
+		}
+
 		f, ok := files[m[1]]
 
 		if !ok {
@@ -67,14 +93,15 @@ func TestNoWriteBarrier(t *testing.T) {
 
 		n, _ := strconv.Atoi(m[2])
 
-		if name := enclosing(fset, f, n); !constructors[name] {
+		if name := enclosing(fset, f, n); !offPath[name] && !offPath[strings.Split(name, ".")[0]] {
 			t.Errorf("%s: write barrier in %s, which the runtime may call through a Provider", line[:len(line)-len(": write barrier")], name)
 		}
 	}
 }
 
 // enclosing returns the name of the function of f that holds the line n,
-// with its receiver type for a method.
+// with its receiver type for a method, or "init" for a line outside every
+// function.
 func enclosing(fset *token.FileSet, f *ast.File, n int) string {
 	for _, d := range f.Decls {
 		fn, ok := d.(*ast.FuncDecl)
@@ -100,5 +127,5 @@ func enclosing(fset *token.FileSet, f *ast.File, n int) string {
 		return fn.Name.Name
 	}
 
-	return "no function"
+	return "init"
 }
