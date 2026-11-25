@@ -177,6 +177,7 @@ func (cpu *CPU) GOMAXPROCS(n int) int {
 
 	// wait for all APs to reach ·apstart idle state
 	if reg.WaitFor(apLimit, taskAddress, 0, 0xffffffff, uint32(n-1)) {
+		cpu.setCores(consecutiveAPs(n))
 		goos.ProcID = cpu.ID
 		goos.Task = cpu.Task
 		goos.Wake = cpu.Wake
@@ -185,6 +186,16 @@ func (cpu *CPU) GOMAXPROCS(n int) int {
 	}
 
 	return runtime.GOMAXPROCS(n)
+}
+
+// consecutiveAPs returns the APIC IDs 1 to n-1, which [CPU.Task] gives the
+// APs when [CPU.StartAPs] did not find them.
+func consecutiveAPs(n int) (aps []int) {
+	for id := 1; id < n; id++ {
+		aps = append(aps, id)
+	}
+
+	return
 }
 
 // InitSMP enables Secure Multiprocessor (SMP) operation by initializing
@@ -306,6 +317,7 @@ func (cpu *CPU) UseAPs(aps []int) {
 	}
 
 	cpu.aps = aps
+	cpu.setCores(aps)
 	goos.ProcID = cpu.ID
 	goos.Task = cpu.Task
 	goos.Wake = cpu.Wake

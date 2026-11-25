@@ -79,9 +79,11 @@ enable_long_mode:
 	MOVL	$(1<<7 | 1<<5), AX	// set CR4.(PGE|PAE)
 	MOVL	AX, CR4
 
+	// The NX bit of a page table entry is reserved, and faults, unless
+	// EFER.NXE is set; the APs set it too (see ·apinit).
 	MOVL	$MSR_EFER, CX
 	RDMSR
-	ORL	$(1<<8), AX		// set MSR_EFER.LME
+	ORL	$(1<<8|1<<11), AX	// set MSR_EFER.(LME|NXE)
 	WRMSR
 
 	MOVL	CR0, AX

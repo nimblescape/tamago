@@ -102,6 +102,9 @@ type CPU struct {
 	// aps holds the APIC IDs of the APs that StartAPs found, in the
 	// order in which Task starts them, or nil
 	aps []int
+	// cores holds the APIC IDs of the processors that run the program,
+	// this processor first, for the TLB shootdowns (see FlushTLB)
+	cores []int
 	// apStacks holds the start stacks of the APs (see prepareAPs)
 	apStacks []byte
 	// taskLock serializes Task
