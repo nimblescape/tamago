@@ -24,13 +24,21 @@ const (
 func newFrames(t testing.TB, ranges ...Range) *Frames {
 	t.Helper()
 
-	n, err := Words(ranges)
+	return newDMAFrames(t, Range{}, ranges...)
+}
+
+// newDMAFrames returns the frames of ranges with the DMA region dma and
+// storage of their own.
+func newDMAFrames(t testing.TB, dma Range, ranges ...Range) *Frames {
+	t.Helper()
+
+	n, err := Words(ranges, dma)
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	f, err := New(ranges, make([]uint64, n))
+	f, err := New(ranges, dma, make([]uint64, n))
 
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +65,7 @@ func TestSplit(t *testing.T) {
 		{Start: 4*gib - 8*kib + 1, End: 4*gib + 12*kib + 5}, // across 4 GiB, not aligned
 		{Start: 1 * mib, End: 1*mib + 4*kib},                // one frame, given after a higher range
 		{Start: 2 * mib, End: 2*mib + 100},                  // less than a frame
-	})
+	}, Range{})
 
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +94,7 @@ func TestSplitRefuses(t *testing.T) {
 		{{Start: 2 * mib, End: 1 * mib}},
 		{{Start: 1 * mib, End: 3 * mib}, {Start: 2 * mib, End: 4 * mib}},
 	} {
-		if _, err := Words(ranges); err == nil {
+		if _, err := Words(ranges, Range{}); err == nil {
 			t.Errorf("%+v: no error", ranges)
 		}
 	}
@@ -95,12 +103,12 @@ func TestSplitRefuses(t *testing.T) {
 func TestNewStorage(t *testing.T) {
 	ranges := []Range{{Start: 0, End: 65 * FrameSize}}
 
-	if _, err := New(ranges, make([]uint64, 1)); err == nil {
+	if _, err := New(ranges, Range{}, make([]uint64, 1)); err == nil {
 		t.Error("storage too small: no error")
 	}
 
 	storage := []uint64{^uint64(0), ^uint64(0)}
-	f, err := New(ranges, storage)
+	f, err := New(ranges, Range{}, storage)
 
 	if err != nil {
 		t.Fatal(err)
@@ -324,5 +332,57 @@ func TestConcurrent(t *testing.T) {
 
 	if total-free != sum {
 		t.Errorf("frames in use %d bytes, owners hold %d", total-free, sum)
+	}
+}
+
+func TestDMARegion(t *testing.T) {
+	dma := Range{Start: 3 * gib, End: 3*gib + 4*FrameSize}
+	areas, err := split([]Range{{Start: 3*gib - 2*FrameSize, End: 4*gib + FrameSize}}, dma)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []area{
+		{start: 3*gib - 2*FrameSize, frames: 2, zone: Low},
+		{start: 3 * gib, frames: 4, zone: DMA},
+		{start: 3*gib + 4*FrameSize, frames: (gib - 4*FrameSize) / FrameSize, zone: Low},
+		{start: 4 * gib, frames: 1, zone: High},
+	}
+
+	if len(areas) != len(want) {
+		t.Fatalf("%d areas, want %d: %+v", len(areas), len(want), areas)
+	}
+
+	for i, a := range areas {
+		if a.start != want[i].start || a.frames != want[i].frames || a.zone != want[i].zone {
+			t.Errorf("area %d: %#x, %d frames, %v; want %#x, %d frames, %v", i, a.start, a.frames, a.zone, want[i].start, want[i].frames, want[i].zone)
+		}
+	}
+
+	f := newDMAFrames(t, dma, Range{Start: 3 * gib, End: 3*gib + 8*FrameSize})
+	o := NewOwner("driver", 0)
+
+	for range 4 {
+		if addr, err := f.Alloc(o, DMA); err != nil || addr < dma.Start || addr >= dma.End {
+			t.Fatalf("DMA frame: got %#x, %v; want one in the DMA region", addr, err)
+		}
+	}
+
+	if _, err := f.Alloc(o, DMA); err != ErrNoMemory {
+		t.Errorf("fifth DMA frame: got %v, want %v", err, ErrNoMemory)
+	}
+
+	if addr, err := f.Alloc(o, Low); err != nil || addr < dma.End {
+		t.Errorf("Low frame: got %#x, %v; want one after the DMA region", addr, err)
+	}
+
+	for _, bad := range []Range{
+		{Start: 3*gib + 7*FrameSize, End: 3*gib + 9*FrameSize}, // not all free memory
+		{Start: 3*gib + 1, End: 3*gib + FrameSize},             // not whole frames
+	} {
+		if _, err := Words([]Range{{Start: 3 * gib, End: 3*gib + 8*FrameSize}}, bad); err == nil {
+			t.Errorf("DMA region %#x-%#x: no error", bad.Start, bad.End)
+		}
 	}
 }

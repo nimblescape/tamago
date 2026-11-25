@@ -16,13 +16,13 @@ func testProvider(t *testing.T, limit uint64) (*Provider, *testSpace, *Owner, *[
 	t.Helper()
 
 	ranges := []Range{{Start: 8 * gib, End: 8*gib + 16*FrameSize}}
-	words, err := Words(ranges)
+	words, err := Words(ranges, Range{})
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	frames, err := New(ranges, make([]uint64, words))
+	frames, err := New(ranges, Range{}, make([]uint64, words))
 
 	if err != nil {
 		t.Fatal(err)

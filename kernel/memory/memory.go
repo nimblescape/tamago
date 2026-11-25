@@ -42,12 +42,16 @@ type Range struct {
 type Zone int
 
 const (
-	// Low is the memory below 4 GiB: the DMA memory of devices with
-	// 32-bit addresses, and the page tables that a core loads while it
-	// starts in 32-bit mode.
+	// Low is the memory below 4 GiB outside the DMA region, such as the
+	// page tables that a core loads while it starts in 32-bit mode.
 	Low Zone = iota
-	// High is the memory from 4 GiB on: the memory of the Go runtime.
+	// High is the memory from 4 GiB on outside the DMA region, such as
+	// the memory of the Go runtime.
 	High
+	// DMA is the fixed DMA region that the platform names (see New). It
+	// holds only DMA buffers and keeps its place and size; on amd64 it
+	// lies below 4 GiB, for devices with 32-bit DMA addresses.
+	DMA
 )
 
 func (z Zone) String() string {
@@ -56,6 +60,8 @@ func (z Zone) String() string {
 		return "below 4 GiB"
 	case High:
 		return "from 4 GiB"
+	case DMA:
+		return "of the DMA region"
 	default:
 		return "unknown zone"
 	}

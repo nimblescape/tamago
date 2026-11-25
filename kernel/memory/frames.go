@@ -33,9 +33,9 @@ type area struct {
 }
 
 // Words returns the number of 64-bit words that New needs as storage for
-// the bitmaps of ranges.
-func Words(ranges []Range) (int, error) {
-	areas, err := split(ranges)
+// the bitmaps of ranges with the DMA region dma.
+func Words(ranges []Range, dma Range) (int, error) {
+	areas, err := split(ranges, dma)
 
 	if err != nil {
 		return 0, err
@@ -52,14 +52,17 @@ func Words(ranges []Range) (int, error) {
 
 // New returns the frames of ranges, which must not overlap. It takes whole
 // frames only, so it rounds the start of each range up and its end down to
-// a multiple of FrameSize, and it splits a range at 4 GiB, so that each
-// area lies in one zone.
+// a multiple of FrameSize, and it splits a range at 4 GiB and at the ends
+// of the DMA region, so that each area lies in one zone.
 //
-// storage holds the bitmaps. It must have Words(ranges) words, lie outside
-// ranges and stay with the frames for their whole life. New clears it, so
-// that every frame starts free.
-func New(ranges []Range, storage []uint64) (*Frames, error) {
-	areas, err := split(ranges)
+// dma is the fixed DMA region, which the platform names: whole frames of
+// the ranges, which only DMA buffers use (zone DMA). It may be empty.
+//
+// storage holds the bitmaps. It must have Words(ranges, dma) words, lie
+// outside ranges and stay with the frames for their whole life. New clears
+// it, so that every frame starts free.
+func New(ranges []Range, dma Range, storage []uint64) (*Frames, error) {
+	areas, err := split(ranges, dma)
 
 	if err != nil {
 		return nil, err
@@ -93,14 +96,20 @@ func New(ranges []Range, storage []uint64) (*Frames, error) {
 	return &Frames{areas: areas}, nil
 }
 
-// split returns the areas of ranges, without bitmaps.
-func split(ranges []Range) ([]area, error) {
+// split returns the areas of ranges with the DMA region dma, without
+// bitmaps.
+func split(ranges []Range, dma Range) ([]area, error) {
+	if dma.Start%FrameSize != 0 || dma.End%FrameSize != 0 || dma.End < dma.Start {
+		return nil, fmt.Errorf("memory: the DMA region %#x to %#x is not made of whole frames", dma.Start, dma.End)
+	}
+
 	sorted := slices.Clone(ranges)
 	slices.SortFunc(sorted, func(a, b Range) int {
 		return cmp.Compare(a.Start, b.Start)
 	})
 
 	var areas []area
+	inDMA := uint64(0)
 
 	for i, r := range sorted {
 		if r.End < r.Start {
@@ -114,17 +123,25 @@ func split(ranges []Range) ([]area, error) {
 		start := alignUp(r.Start, FrameSize)
 		end := r.End &^ (FrameSize - 1)
 
-		for _, part := range [...]Range{
-			{start, min(end, lowEnd)},
-			{max(start, lowEnd), end},
-		} {
+		// The range splits at 4 GiB and at the ends of the DMA
+		// region, so that each area lies in one zone.
+		cuts := []uint64{start, end, lowEnd, dma.Start, dma.End}
+		slices.Sort(cuts)
+
+		for j := 1; j < len(cuts); j++ {
+			part := Range{max(start, cuts[j-1]), min(end, cuts[j])}
+
 			if part.Start >= part.End {
 				continue
 			}
 
 			zone := High
 
-			if part.End <= lowEnd {
+			switch {
+			case part.Start >= dma.Start && part.End <= dma.End:
+				zone = DMA
+				inDMA += part.End - part.Start
+			case part.End <= lowEnd:
 				zone = Low
 			}
 
@@ -134,6 +151,10 @@ func split(ranges []Range) ([]area, error) {
 				zone:   zone,
 			})
 		}
+	}
+
+	if inDMA != dma.End-dma.Start {
+		return nil, fmt.Errorf("memory: the DMA region %#x to %#x is not free memory", dma.Start, dma.End)
 	}
 
 	return areas, nil

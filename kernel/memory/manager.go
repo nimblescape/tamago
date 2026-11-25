@@ -109,7 +109,7 @@ func (m *Manager) NewOwner(name string, limit uint64) *Owner {
 }
 
 // Owners returns the owners that have not ended, in the order of their
-// start.
+// start, the children with the others (see Owner.Parent).
 func (m *Manager) Owners() []*Owner {
 	m.lock.Lock()
 	defer m.lock.Unlock()
@@ -119,7 +119,7 @@ func (m *Manager) Owners() []*Owner {
 
 func (m *Manager) adopt(o *Owner) {
 	o.lock.Lock()
-	o.forget = m.forget
+	o.manager = m
 	o.lock.Unlock()
 
 	m.lock.Lock()
@@ -174,16 +174,15 @@ type Buffer struct {
 	released atomic.Bool
 }
 
-// DMA gives o a DMA buffer of size bytes from zone z, aligned to align
-// bytes, filled with zeros. Devices that reach only 32-bit addresses need
-// zone Low.
-func (m *Manager) DMA(o *Owner, z Zone, size, align uint64) (*Buffer, error) {
+// DMA gives o a DMA buffer of size bytes from the DMA region (zone DMA),
+// aligned to align bytes, filled with zeros.
+func (m *Manager) DMA(o *Owner, size, align uint64) (*Buffer, error) {
 	if size == 0 || align&(align-1) != 0 {
 		return nil, fmt.Errorf("memory: invalid DMA buffer of %d bytes with alignment %d", size, align)
 	}
 
 	n := frameCount(size)
-	addr, err := m.frames.AllocRun(o, z, n, max(align, FrameSize))
+	addr, err := m.frames.AllocRun(o, DMA, n, max(align, FrameSize))
 
 	if err != nil {
 		return nil, err

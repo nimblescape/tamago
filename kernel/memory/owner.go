@@ -37,11 +37,17 @@ type Piece interface {
 // heap, a driver, the page tables, the tables of the IOMMU, and later a
 // process or a guest. It counts its frames and may have a limit of frames.
 // It records every other piece, so that End gives everything back.
+//
+// An owner may have children (NewChild), such as the drivers of the
+// kernel or the owners of a guest. The frames of a child count also for
+// its parent, so the limit of the parent holds for the parent and all its
+// children together, and End of the parent ends its children.
 type Owner struct {
 	name    string
 	limited bool
 	limit   uint64 // frames
 	frames  atomic.Uint64
+	parent  *Owner // set once, when the owner is made
 
 	// lock guards the fields below. The memory provider of the runtime
 	// never takes it: it changes only the count of frames.
@@ -49,8 +55,8 @@ type Owner struct {
 	pieces []Piece
 	domain AddressSpace
 	ended  bool
-	// forget removes the owner from its manager after End.
-	forget func(*Owner)
+	// manager is the manager that lists the owner, or nil.
+	manager *Manager
 }
 
 // NewOwner returns an owner with the name name. It may hold at most limit
@@ -63,12 +69,45 @@ func NewOwner(name string, limit uint64) *Owner {
 	}
 }
 
+// NewChild returns a new owner with the name name, which may hold at most
+// limit bytes, or any amount when limit is 0, and whose frames count also
+// for o. The child is a piece of o and is listed by the manager of o.
+func (o *Owner) NewChild(name string, limit uint64) (*Owner, error) {
+	c := NewOwner(name, limit)
+	c.parent = o
+
+	if err := o.Hold(c); err != nil {
+		return nil, err
+	}
+
+	o.lock.Lock()
+	m := o.manager
+	o.lock.Unlock()
+
+	if m != nil {
+		m.adopt(c)
+	}
+
+	return c, nil
+}
+
+// Parent returns the parent of the owner, or nil.
+func (o *Owner) Parent() *Owner {
+	return o.parent
+}
+
+// Release ends the owner as a piece of its parent (see End).
+func (o *Owner) Release() error {
+	return o.End()
+}
+
 // Name returns the name of the owner.
 func (o *Owner) Name() string {
 	return o.name
 }
 
-// Bytes returns the number of bytes of frames that the owner holds.
+// Bytes returns the number of bytes of frames that the owner and its
+// children hold.
 func (o *Owner) Bytes() uint64 {
 	return o.frames.Load() * FrameSize
 }
@@ -170,7 +209,7 @@ func (o *Owner) End() error {
 	o.ended = true
 	pieces := o.pieces
 	o.pieces = nil
-	forget := o.forget
+	m := o.manager
 	o.lock.Unlock()
 
 	var errs []error
@@ -187,8 +226,12 @@ func (o *Owner) End() error {
 		errs = append(errs, fmt.Errorf("memory: owner %q still holds %d frames after its end", o.name, n))
 	}
 
-	if forget != nil {
-		forget(o)
+	if o.parent != nil {
+		o.parent.Drop(o)
+	}
+
+	if m != nil {
+		m.forget(o)
 	}
 
 	return errors.Join(errs...)
@@ -202,11 +245,38 @@ func (o *Owner) Ended() bool {
 	return o.ended
 }
 
-// take counts n more frames for the owner and reports true, unless the
-// owner would then hold more than its limit.
+// take counts n more frames for the owner and its parents and reports
+// true, unless one of them would then hold more than its limit.
 //
 //go:nosplit
 func (o *Owner) take(n uint64) bool {
+	for p := o; p != nil; p = p.parent {
+		if !p.takeOwn(n) {
+			for q := o; q != p; q = q.parent {
+				q.giveOwn(n)
+			}
+
+			return false
+		}
+	}
+
+	return true
+}
+
+// give counts n frames fewer for the owner and its parents.
+//
+//go:nosplit
+func (o *Owner) give(n uint64) {
+	for p := o; p != nil; p = p.parent {
+		p.giveOwn(n)
+	}
+}
+
+// takeOwn counts n more frames for the owner alone, unless it would then
+// hold more than its limit.
+//
+//go:nosplit
+func (o *Owner) takeOwn(n uint64) bool {
 	for {
 		held := o.frames.Load()
 
@@ -220,10 +290,10 @@ func (o *Owner) take(n uint64) bool {
 	}
 }
 
-// give counts n frames fewer for the owner.
+// giveOwn counts n frames fewer for the owner alone.
 //
 //go:nosplit
-func (o *Owner) give(n uint64) {
+func (o *Owner) giveOwn(n uint64) {
 	for {
 		held := o.frames.Load()
 

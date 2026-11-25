@@ -42,6 +42,8 @@ var offPath = map[string]bool{
 	"Owner.Drop":      true,
 	"Owner.End":       true,
 	"Owner.Pieces":    true,
+	"Owner.NewChild":  true,
+	"Owner.Release":   true,
 	"Tables.Reach":    true,
 	"Space.Prepared":  true,
 	"remove":          true,

@@ -19,9 +19,10 @@ import (
 // memory of the test.
 const device = 0xfee0_0000
 
-// testManager is a Manager over 16 frames of the memory of the test, with a
-// window of 16 pages in other memory of the test, so that the clearing of
-// buffers and regions writes to real memory.
+// testManager is a Manager over 16 frames of the memory of the test, the
+// first 8 of them the DMA region, with a window of 16 pages in other
+// memory of the test, so that the clearing of buffers and regions writes
+// to real memory.
 type testManager struct {
 	*Manager
 	space  *testSpace
@@ -38,7 +39,7 @@ func newTestManager(t *testing.T, windows ...Range) *testManager {
 	s := newTestSpace()
 
 	m, err := NewManager(Config{
-		Frames:  newFrames(t, mem),
+		Frames:  newDMAFrames(t, Range{Start: mem.Start, End: mem.Start + 8*FrameSize}, mem),
 		Space:   s,
 		Window:  win,
 		Memory:  []Range{mem},
@@ -90,7 +91,7 @@ func TestDMA(t *testing.T) {
 	defer runtime.KeepAlive(tm.bufs)
 
 	o := tm.NewOwner("driver", 0)
-	b, err := tm.DMA(o, zoneOf(tm.memory), 3*FrameSize-10, 2*FrameSize)
+	b, err := tm.DMA(o, 3*FrameSize-10, 2*FrameSize)
 
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +133,7 @@ func TestDMA(t *testing.T) {
 	}
 
 	for _, c := range []struct{ size, align uint64 }{{0, FrameSize}, {FrameSize, 3 * FrameSize}} {
-		if _, err := tm.DMA(o, zoneOf(tm.memory), c.size, c.align); err == nil {
+		if _, err := tm.DMA(o, c.size, c.align); err == nil {
 			t.Errorf("DMA of %d bytes aligned to %d: no error", c.size, c.align)
 		}
 	}
@@ -153,7 +154,7 @@ func TestDMADomain(t *testing.T) {
 		t.Error("second domain: no error")
 	}
 
-	b, err := tm.DMA(o, zoneOf(tm.memory), FrameSize, FrameSize)
+	b, err := tm.DMA(o, FrameSize, FrameSize)
 
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +177,7 @@ func TestDMADomain(t *testing.T) {
 	// A failed map in the domain gives everything back.
 	domain.fail = errors.New("test: domain full")
 
-	if _, err := tm.DMA(o, zoneOf(tm.memory), FrameSize, FrameSize); err == nil {
+	if _, err := tm.DMA(o, FrameSize, FrameSize); err == nil {
 		t.Fatal("DMA with a failed map in the domain: no error")
 	}
 
@@ -185,7 +186,7 @@ func TestDMADomain(t *testing.T) {
 	// The domain must come before the first buffer.
 	other := tm.NewOwner("other driver", 0)
 
-	if _, err := tm.DMA(other, zoneOf(tm.memory), FrameSize, FrameSize); err != nil {
+	if _, err := tm.DMA(other, FrameSize, FrameSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -201,7 +202,7 @@ func TestDMARefusesWindow(t *testing.T) {
 
 	o := tm.NewOwner("driver", 0)
 
-	if _, err := tm.DMA(o, zoneOf(tm.memory), FrameSize, FrameSize); err == nil {
+	if _, err := tm.DMA(o, FrameSize, FrameSize); err == nil {
 		t.Fatal("DMA buffer in a window: no error")
 	}
 
@@ -335,7 +336,7 @@ func TestOwnerEnd(t *testing.T) {
 
 	o := tm.NewOwner("driver", 0)
 
-	if _, err := tm.DMA(o, zoneOf(tm.memory), FrameSize, FrameSize); err != nil {
+	if _, err := tm.DMA(o, FrameSize, FrameSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -366,7 +367,7 @@ func TestOwnerEnd(t *testing.T) {
 	}
 
 	// An ended owner takes no new piece.
-	if _, err := tm.DMA(o, zoneOf(tm.memory), FrameSize, FrameSize); !errors.Is(err, ErrEnded) {
+	if _, err := tm.DMA(o, FrameSize, FrameSize); !errors.Is(err, ErrEnded) {
 		t.Errorf("DMA after End: got %v, want %v", err, ErrEnded)
 	}
 
@@ -439,5 +440,75 @@ func TestOwnerPieces(t *testing.T) {
 
 	if o.String() == "" || o.Name() != "process" || o.Limit() != 0 {
 		t.Errorf("owner %v", o)
+	}
+}
+
+func TestOwnerChildren(t *testing.T) {
+	tm := newTestManager(t)
+	defer runtime.KeepAlive(tm.bufs)
+
+	kernel := tm.NewOwner("kernel", 4*FrameSize)
+	driver, err := kernel.NewChild("driver", 0)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	heap, err := kernel.NewChild("Go heap", 2*FrameSize)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if driver.Parent() != kernel || !slices.Contains(tm.Owners(), driver) || !slices.Contains(kernel.Pieces(), Piece(driver)) {
+		t.Fatal("the child is not a piece of its parent or not listed by the manager")
+	}
+
+	// The children share the limit of the parent.
+	if _, err := tm.DMA(driver, 3*FrameSize, FrameSize); err != nil {
+		t.Fatal(err)
+	}
+
+	if kernel.Bytes() != 3*FrameSize || driver.Bytes() != 3*FrameSize {
+		t.Fatalf("kernel %d bytes, driver %d bytes; want 3 frames each", kernel.Bytes(), driver.Bytes())
+	}
+
+	frame, err := tm.Frames().Alloc(heap, zoneOf(tm.memory))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The fifth frame passes the limit of the heap, not the limit of
+	// the kernel.
+	if _, err := tm.Frames().Alloc(heap, zoneOf(tm.memory)); !errors.Is(err, ErrLimit) {
+		t.Fatalf("a fifth frame for the kernel: got %v, want %v", err, ErrLimit)
+	}
+
+	if heap.Bytes() != FrameSize || driver.Bytes() != 3*FrameSize || kernel.Bytes() != 4*FrameSize {
+		t.Fatalf("after a refused frame: heap %d, driver %d, kernel %d bytes", heap.Bytes(), driver.Bytes(), kernel.Bytes())
+	}
+
+	tm.Frames().Free(heap, frame, 1)
+
+	// The end of the parent ends the children.
+	if err := kernel.End(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !driver.Ended() || !heap.Ended() || kernel.Bytes() != 0 || len(tm.Owners()) != 0 {
+		t.Fatalf("after End: driver ended %v, heap ended %v, kernel %d bytes, owners %v", driver.Ended(), heap.Ended(), kernel.Bytes(), tm.Owners())
+	}
+
+	if _, err := kernel.NewChild("late", 0); !errors.Is(err, ErrEnded) {
+		t.Errorf("NewChild after End: got %v, want %v", err, ErrEnded)
+	}
+
+	// A child that ends leaves its parent.
+	parent := tm.NewOwner("guest", 0)
+	child, _ := parent.NewChild("vCPU", 0)
+
+	if err := child.End(); err != nil || len(parent.Pieces()) != 0 {
+		t.Errorf("End of the child: %v, parent pieces %v", err, parent.Pieces())
 	}
 }
