@@ -50,9 +50,6 @@ type Provider struct {
 	zone   Zone
 	space  AddressSpace
 
-	// free gives a reclaimed frame back. It is made once, so that
-	// Unuse passes it to Reclaim without an allocation.
-	free func(phys, size uint64)
 	// clear fills memory of the window with zeros.
 	clear func(virt, size uint64)
 }
@@ -78,10 +75,6 @@ func NewProvider(cfg ProviderConfig) (*Provider, error) {
 		clear:  clearMemory,
 	}
 
-	p.free = func(phys, size uint64) {
-		p.frames.Free(p.owner, phys, size/FrameSize)
-	}
-
 	return p, nil
 }
 
@@ -99,64 +92,133 @@ func (p *Provider) Reserve(hint, size, align uintptr) uintptr {
 }
 
 // Use gives each page of the range that has no frame a frame filled with
-// zeros. Pages that have a frame keep it.
+// zeros. Pages that have a frame keep it. The frames of a run of such pages
+// come from a few calls of Frames.AllocUpTo, and each page gets its own
+// Map, so that the window holds only pages of the smallest size, which
+// Unuse can give back one at a time.
 func (p *Provider) Use(addr, size uintptr) {
-	for virt := uint64(addr); virt < uint64(addr+size); virt += FrameSize {
+	end := uint64(addr + size)
+
+	for virt := uint64(addr); virt < end; {
 		if p.mapped(virt) {
+			virt += FrameSize
 			continue
 		}
 
-		phys, err := p.frames.Alloc(p.owner, p.zone)
+		run := virt + FrameSize
 
-		if err != nil {
-			fatal("memory: no frame for the memory of ", p.owner.Name(), ": ", err)
+		for run < end && !p.mapped(run) {
+			run += FrameSize
 		}
 
-		if err := p.space.Map(virt, phys, FrameSize, Data); err != nil {
-			fatal("memory: map of a page for ", p.owner.Name(), ": ", err)
-		}
+		for virt < run {
+			phys, n, err := p.frames.AllocUpTo(p.owner, p.zone, (run-virt)/FrameSize)
 
-		p.clear(virt, FrameSize)
+			if err != nil {
+				fatal("memory: no frame for the memory of ", p.owner.Name(), ": ", err)
+			}
+
+			for off := uint64(0); off < n*FrameSize; off += FrameSize {
+				if err := p.space.Map(virt+off, phys+off, FrameSize, Data); err != nil {
+					fatal("memory: map of a page for ", p.owner.Name(), ": ", err)
+				}
+			}
+
+			p.clear(virt, n*FrameSize)
+			virt += n * FrameSize
+		}
 	}
 }
 
+// unuseRuns is the number of runs of contiguous frames that Unuse collects
+// before each flush.
+const unuseRuns = 32
+
 // Unuse takes the frames of the range back and keeps the range reserved.
-// Each page is cleared before it is unmapped.
+// Each page is cleared before it is unmapped. Unuse notes the frames of the
+// pages that it unmaps as runs of contiguous frames, and frees each run
+// with one call of Frames.Free after the flush and the reclaim. When the
+// frames of the range form more than unuseRuns runs, it does this in
+// several parts, each with its own flush.
 func (p *Provider) Unuse(addr, size uintptr) {
 	start, end := uint64(addr), uint64(addr+size)
-	unmapped := false
 
-	for virt := start; virt < end; {
-		if !p.mapped(virt) {
-			virt += FrameSize
+	for start < end {
+		var runs [unuseRuns]Range
+
+		n, next := p.unmapRuns(start, end, &runs)
+
+		if n > 0 {
+			p.space.Flush()
+
+			if err := p.space.Reclaim(start, next-start, noFree); err != nil {
+				fatal("memory: reclaim of pages of ", p.owner.Name(), ": ", err)
+			}
+
+			for _, r := range runs[:n] {
+				p.frames.Free(p.owner, r.Start, (r.End-r.Start)/FrameSize)
+			}
+		}
+
+		start = next
+	}
+}
+
+// unmapRuns clears and unmaps the mapped pages from start on, until end or
+// until their frames would form more than unuseRuns runs. It writes the
+// runs of frames into runs and returns their number and the end of the part
+// that it handled.
+func (p *Provider) unmapRuns(start, end uint64, runs *[unuseRuns]Range) (n int, next uint64) {
+	// run is the first page of the run of mapped pages that ends at
+	// virt.
+	run := start
+	virt := start
+
+	for ; virt < end; virt += FrameSize {
+		phys, _, ok := p.space.Lookup(virt)
+
+		if ok && n > 0 && runs[n-1].End == phys {
+			runs[n-1].End += FrameSize
 			continue
 		}
 
-		run := virt
-
-		for virt < end && p.mapped(virt) {
-			virt += FrameSize
+		if ok && n < unuseRuns {
+			runs[n] = Range{phys, phys + FrameSize}
+			n++
+			continue
 		}
 
-		p.clear(run, virt-run)
+		p.unmap(run, virt)
+		run = virt + FrameSize
 
-		if err := p.space.Unmap(run, virt-run); err != nil {
-			fatal("memory: unmap of pages of ", p.owner.Name(), ": ", err)
+		if ok {
+			// runs is full, so the part ends before this page.
+			return n, virt
 		}
-
-		unmapped = true
 	}
 
-	if !unmapped {
+	p.unmap(run, virt)
+
+	return n, virt
+}
+
+// unmap clears and unmaps the pages from start to end, which are all
+// mapped. An empty range is no error.
+func (p *Provider) unmap(start, end uint64) {
+	if start >= end {
 		return
 	}
 
-	p.space.Flush()
+	p.clear(start, end-start)
 
-	if err := p.space.Reclaim(start, end-start, p.free); err != nil {
-		fatal("memory: reclaim of pages of ", p.owner.Name(), ": ", err)
+	if err := p.space.Unmap(start, end-start); err != nil {
+		fatal("memory: unmap of pages of ", p.owner.Name(), ": ", err)
 	}
 }
+
+// noFree is the free function of Reclaim in Unuse, which frees the frames
+// itself.
+func noFree(phys, size uint64) {}
 
 // mapped reports whether the page at virt is mapped.
 func (p *Provider) mapped(virt uint64) bool {

@@ -187,6 +187,67 @@ func (f *Frames) AllocRun(o *Owner, z Zone, n, align uint64) (uint64, error) {
 	return addr, nil
 }
 
+// AllocUpTo gives up to n contiguous frames of zone z to o, at least one,
+// and returns the address of the first and their number. It takes the
+// first free frame that the search for a single frame finds, and the free
+// frames that follow it. So a caller that needs many frames takes them in
+// a few calls, each with one pass of the lock, and not one call per frame.
+func (f *Frames) AllocUpTo(o *Owner, z Zone, n uint64) (addr, got uint64, err error) {
+	if n == 0 {
+		panic("memory: invalid number of frames")
+	}
+
+	if !o.take(n) {
+		return 0, 0, ErrLimit
+	}
+
+	addr, got = f.allocUpToLocked(z, n)
+
+	if got < n {
+		o.give(n - got)
+	}
+
+	if got == 0 {
+		return 0, 0, ErrNoMemory
+	}
+
+	return addr, got, nil
+}
+
+// allocUpToLocked marks the first free frame of zone z and the free frames
+// after it, up to n, as in use, and returns the address of the first and
+// their number.
+//
+//go:nosplit
+func (f *Frames) allocUpToLocked(z Zone, n uint64) (addr, got uint64) {
+	f.lock.lock()
+
+	for i := range f.areas {
+		a := &f.areas[i]
+
+		if a.zone != z || a.free == 0 {
+			continue
+		}
+
+		first, ok := a.findOne()
+
+		if !ok {
+			continue
+		}
+
+		got = a.freeRun(first, n)
+		a.mark(first, got, true)
+		a.free -= got
+		a.next = first + got
+		addr = a.start + first*FrameSize
+		break
+	}
+
+	f.lock.unlock()
+
+	return addr, got
+}
+
 // allocLocked marks the first fitting run of n free frames of zone z as in
 // use and returns the address of its first frame.
 //
@@ -317,6 +378,37 @@ func (a *area) findOne() (uint64, bool) {
 	return 0, false
 }
 
+// freeRun returns the number of free frames from frame i on, at most n.
+// It checks the bitmap a word at a time. The bits after the last frame are
+// set, so the count ends at the end of the area.
+//
+//go:nosplit
+func (a *area) freeRun(i, n uint64) uint64 {
+	k := i
+
+	for k-i < n {
+		w := a.used[k/64] >> (k % 64)
+
+		if w&1 != 0 {
+			break
+		}
+
+		run := 64 - k%64
+
+		if w != 0 {
+			run = uint64(bits.TrailingZeros64(w))
+		}
+
+		k += min(run, n-(k-i))
+
+		if k >= a.frames || w != 0 {
+			break
+		}
+	}
+
+	return min(k, a.frames) - i
+}
+
 // findRun returns the index of the first run of n free frames whose
 // address is a multiple of align. After a used frame inside a candidate
 // run, the search goes on after that frame.
@@ -364,10 +456,14 @@ func (a *area) lastUsed(i, n uint64) (uint64, bool) {
 //
 //go:nosplit
 func (a *area) allUsed(i, n uint64) bool {
-	for k := i; k < i+n; k++ {
-		if a.used[k/64]&(1<<(k%64)) == 0 {
+	for n > 0 {
+		m, c := wordMask(i, n)
+
+		if a.used[i/64]&m != m {
 			return false
 		}
+
+		i, n = i+c, n-c
 	}
 
 	return true
@@ -377,13 +473,28 @@ func (a *area) allUsed(i, n uint64) bool {
 //
 //go:nosplit
 func (a *area) mark(i, n uint64, used bool) {
-	for k := i; k < i+n; k++ {
+	for n > 0 {
+		m, c := wordMask(i, n)
+
 		if used {
-			a.used[k/64] |= 1 << (k % 64)
+			a.used[i/64] |= m
 		} else {
-			a.used[k/64] &^= 1 << (k % 64)
+			a.used[i/64] &^= m
 		}
+
+		i, n = i+c, n-c
 	}
+}
+
+// wordMask returns the bits of the word of frame i that the n frames from
+// frame i on cover, and their number.
+//
+//go:nosplit
+func wordMask(i, n uint64) (mask, count uint64) {
+	bit := i % 64
+	count = min(64-bit, n)
+
+	return ^uint64(0) >> (64 - count) << bit, count
 }
 
 // words returns the number of 64-bit words of a bitmap of n frames.

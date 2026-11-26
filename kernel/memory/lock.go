@@ -23,9 +23,15 @@ type spinLock struct {
 	held atomic.Bool
 }
 
+// lock waits with plain loads while the lock is held and tries to take it
+// only when it is free, so that the waiting cores do not take the cache
+// line from the holder again and again.
+//
 //go:nosplit
 func (l *spinLock) lock() {
 	for !l.held.CompareAndSwap(false, true) {
+		for l.held.Load() {
+		}
 	}
 }
 

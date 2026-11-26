@@ -78,13 +78,24 @@ func TestProviderUse(t *testing.T) {
 		}
 	}
 
-	if len(*cleared) != 4 {
-		t.Errorf("%d pages cleared, want 4", len(*cleared))
+	if n := clearedBytes(*cleared); n != 4*FrameSize {
+		t.Errorf("%d bytes cleared, want 4 pages", n)
 	}
 
 	if m.flushes != 0 {
 		t.Error("Use flushed the TLB")
 	}
+}
+
+// clearedBytes returns the bytes of all cleared ranges.
+func clearedBytes(cleared []Range) uint64 {
+	n := uint64(0)
+
+	for _, r := range cleared {
+		n += r.End - r.Start
+	}
+
+	return n
 }
 
 func TestProviderUnuse(t *testing.T) {
@@ -130,6 +141,70 @@ func TestProviderUnuse(t *testing.T) {
 
 	if owner.Bytes() != 8*FrameSize {
 		t.Errorf("after the second Use: owner %d bytes", owner.Bytes())
+	}
+}
+
+func TestProviderUnuseParts(t *testing.T) {
+	ranges := []Range{{Start: 8 * gib, End: 8*gib + 128*FrameSize}}
+	words, err := Words(ranges, Range{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := New(ranges, Range{}, make([]uint64, words))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestSpace()
+	owner := NewOwner("Go heap", 0)
+	p, err := NewProvider(ProviderConfig{
+		Window: Range{Start: window, End: window + 128*FrameSize},
+		Frames: frames,
+		Owner:  owner,
+		Zone:   High,
+		Space:  m,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.clear = func(virt, size uint64) {}
+
+	a := p.Reserve(0, 64*FrameSize, FrameSize)
+	b := p.Reserve(0, 64*FrameSize, FrameSize)
+
+	// The pages of a and b take turns, so the 64 frames of a form 64
+	// runs of one frame, which Unuse handles in two parts.
+	for i := range uintptr(64) {
+		p.Use(a+i*FrameSize, FrameSize)
+		p.Use(b+i*FrameSize, FrameSize)
+	}
+
+	p.Unuse(a, 64*FrameSize)
+
+	if m.flushes != 2 {
+		t.Errorf("%d flushes, want 2", m.flushes)
+	}
+
+	if len(m.mapped) != 64 || len(m.unmapped) != 0 || owner.Bytes() != 64*FrameSize {
+		t.Errorf("after Unuse: %d mapped, %d waiting, owner %d frames", len(m.mapped), len(m.unmapped), owner.Bytes()/FrameSize)
+	}
+
+	for virt := range m.mapped {
+		if virt < uint64(b) {
+			t.Errorf("page %#x of the range is still mapped", virt)
+		}
+	}
+
+	// The 64 frames serve again, as one run.
+	p.Use(a, 64*FrameSize)
+
+	if owner.Bytes() != 128*FrameSize {
+		t.Errorf("after the second Use: owner %d frames, want 128", owner.Bytes()/FrameSize)
 	}
 }
 

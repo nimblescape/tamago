@@ -277,6 +277,113 @@ func TestFindOneWraps(t *testing.T) {
 	}
 }
 
+func TestAllocUpTo(t *testing.T) {
+	const base = 4 * gib
+
+	// 200 frames: the run crosses words, and the area ends inside a word.
+	f := newFrames(t, Range{Start: base, End: base + 200*FrameSize})
+	o := NewOwner("test", 150*FrameSize)
+
+	addr, got, err := f.AllocUpTo(o, High, 70)
+
+	if err != nil || addr != base || got != 70 {
+		t.Fatalf("first: got %#x, %d, %v; want %#x, 70", addr, got, err, uint64(base))
+	}
+
+	// A used frame in the middle ends the run before it.
+	if _, err := f.Alloc(o, High); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Free(o, base+10*FrameSize, 20)
+
+	addr, got, err = f.AllocUpTo(o, High, 50)
+
+	if err != nil || addr != base+71*FrameSize || got != 50 {
+		t.Errorf("after the used frame: got %#x, %d, %v; want frame 71, 50", addr, got, err)
+	}
+
+	// The owner pays only for the frames that it got.
+	if want := uint64(70 - 20 + 1 + 50); o.Bytes() != want*FrameSize {
+		t.Errorf("owner holds %d frames, want %d", o.Bytes()/FrameSize, want)
+	}
+
+	// The limit counts the whole request.
+	if _, _, err := f.AllocUpTo(o, High, 50); err != ErrLimit {
+		t.Errorf("over the limit: got %v, want ErrLimit", err)
+	}
+
+	// The search goes on after the last run, to the end of the area.
+	addr, got, err = f.AllocUpTo(o, High, 28)
+
+	if err != nil || addr != base+121*FrameSize || got != 28 {
+		t.Errorf("at the end: got %#x, %d, %v; want frame 121, 28", addr, got, err)
+	}
+
+	o2 := NewOwner("test 2", 0)
+	addr, got, err = f.AllocUpTo(o2, High, 100)
+
+	if err != nil || addr != base+149*FrameSize || got != 51 {
+		t.Errorf("up to the end of the area: got %#x, %d, %v; want frame 149, 51", addr, got, err)
+	}
+
+	// Then the search wraps to the freed frames.
+	addr, got, err = f.AllocUpTo(o2, High, 100)
+
+	if err != nil || addr != base+10*FrameSize || got != 20 {
+		t.Errorf("after the wrap: got %#x, %d, %v; want frame 10, 20", addr, got, err)
+	}
+
+	if _, _, err := f.AllocUpTo(o2, High, 1); err != ErrNoMemory {
+		t.Errorf("no frame left: got %v, want ErrNoMemory", err)
+	}
+
+	if o2.Bytes() != 71*FrameSize {
+		t.Errorf("owner 2 holds %d frames, want 71", o2.Bytes()/FrameSize)
+	}
+
+	mustPanic(t, "AllocUpTo of 0 frames", func() { f.AllocUpTo(o, High, 0) })
+}
+
+func TestFreeRun(t *testing.T) {
+	a := area{frames: 130, used: make([]uint64, 3)}
+	all := ^uint64(0)
+	a.used[2] = all << 2 // the bits after the last frame
+
+	for _, c := range []struct{ i, n, want uint64 }{
+		{0, 1, 1},
+		{0, 64, 64},
+		{0, 200, 130},
+		{63, 3, 3},
+		{100, 100, 30},
+		{129, 5, 1},
+	} {
+		if got := a.freeRun(c.i, c.n); got != c.want {
+			t.Errorf("freeRun(%d, %d) = %d, want %d", c.i, c.n, got, c.want)
+		}
+	}
+
+	a.mark(60, 10, true)
+
+	if !a.allUsed(60, 10) || a.allUsed(59, 2) || a.allUsed(69, 2) {
+		t.Error("mark across a word: wrong bits")
+	}
+
+	if got := a.freeRun(0, 100); got != 60 {
+		t.Errorf("freeRun before a used frame = %d, want 60", got)
+	}
+
+	if got := a.freeRun(70, 100); got != 60 {
+		t.Errorf("freeRun after the used frames = %d, want 60", got)
+	}
+
+	a.mark(60, 10, false)
+
+	if a.used[0] != 0 || a.used[1] != 0 {
+		t.Error("mark as free across a word: bits stay set")
+	}
+}
+
 func TestConcurrent(t *testing.T) {
 	const workers, rounds = 8, 2000
 

@@ -54,7 +54,19 @@ func FuzzFrames(f *testing.F) {
 				n := uint64(y%8) + 1
 				align := uint64(FrameSize) << (y / 8 % 4)
 
-				addr, err := frames.AllocRun(owners[o], z, n, align)
+				// An op 1 with y from 128 on takes frames with
+				// AllocUpTo, which may give fewer than n.
+				upTo := op%3 == 1 && y >= 128
+
+				var addr uint64
+				var err error
+
+				if upTo {
+					align = FrameSize
+					addr, err = allocUpTo(t, frames, model, owners[o], z, &n)
+				} else {
+					addr, err = frames.AllocRun(owners[o], z, n, align)
+				}
 
 				switch {
 				case errors.Is(err, ErrLimit):
@@ -72,6 +84,12 @@ func FuzzFrames(f *testing.F) {
 
 					continue
 				case errors.Is(err, ErrNoMemory):
+					// AllocUpTo fails only when no frame of
+					// the zone is free.
+					if upTo {
+						n = 1
+					}
+
 					if fits(frames, model, z, n, align) {
 						t.Fatalf("ErrNoMemory, but %d frames aligned to %#x fit in zone %v", n, align, z)
 					}
@@ -135,6 +153,39 @@ func FuzzFrames(f *testing.F) {
 
 		check(t, frames, owners, map[uint64]int{})
 	})
+}
+
+// allocUpTo takes up to *n frames with AllocUpTo, sets *n to the number
+// that it got, and checks that the run ends only at its size, at a used
+// frame or at the end of an area.
+func allocUpTo(t *testing.T, frames *Frames, model map[uint64]int, o *Owner, z Zone, n *uint64) (uint64, error) {
+	t.Helper()
+
+	addr, got, err := frames.AllocUpTo(o, z, *n)
+
+	if err != nil {
+		return 0, err
+	}
+
+	if got == 0 || got > *n {
+		t.Fatalf("AllocUpTo of %d frames gave %d", *n, got)
+	}
+
+	if next := addr + got*FrameSize; got < *n {
+		_, taken := model[next]
+
+		for _, a := range frames.areas {
+			end := a.start + a.frames*FrameSize
+
+			if a.start <= addr && addr < end && next < end && !taken {
+				t.Fatalf("AllocUpTo gave %d of %d frames at %#x, but frame %#x is free", got, *n, addr, next)
+			}
+		}
+	}
+
+	*n = got
+
+	return addr, nil
 }
 
 // check compares the counts of the owners and the zones with the model.
