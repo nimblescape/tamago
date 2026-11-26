@@ -177,28 +177,14 @@ wait:
 	MOVQ	$0, task_gp(AX)
 	MOVQ	$0, task_pc(AX)
 
-	MOVQ	g, DI
-	CALL	·settls(SB)
-	// The two-instruction form also builds with -buildmode=pie.
-	MOVQ	TLS, AX
-	MOVQ	g, 0(AX)(TLS*1)
-
 	// enable LAPIC
 	MOVL	$(const_LAPIC_SVR), AX
 	MOVL	$(1<<const_SVR_ENABLE), (AX)	// set SVR_ENABLE
 
-	// call task target
+	// call task target, which sets up its TLS block itself (see
+	// goos.Task)
 	STI
 	CALL	R12
 
 	// go back to idle state in case we return
 	JMP wait
-
-TEXT ·settls(SB),NOSPLIT,$0
-	ADDQ	$8, DI	// ELF wants to use -8(FS)
-	MOVQ	DI, AX
-	MOVQ	DI, DX
-	SHRQ	$32, DX	// WRMSR writes EDX:EAX, so EDX holds the high 32 bits
-	MOVQ	$MSR_FS_BASE, CX
-	WRMSR
-	RET
