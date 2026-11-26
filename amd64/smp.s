@@ -179,7 +179,9 @@ wait:
 
 	MOVQ	g, DI
 	CALL	·settls(SB)
-	MOVQ	g, (TLS)
+	// The two-instruction form also builds with -buildmode=pie.
+	MOVQ	TLS, AX
+	MOVQ	g, 0(AX)(TLS*1)
 
 	// enable LAPIC
 	MOVL	$(const_LAPIC_SVR), AX
