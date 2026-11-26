@@ -48,7 +48,7 @@ func TestGive(t *testing.T) {
 	}
 
 	if g.Register(0) != device+0x10 {
-		t.Errorf("registers at %#x, want 1:1 at %#x", g.Register(0), device+0x10)
+		t.Errorf("registers at %#x, want 1:1 at %#x", g.Register(0), uint64(device+0x10))
 	}
 
 	for _, virt := range []uint64{device, device + FrameSize} {
