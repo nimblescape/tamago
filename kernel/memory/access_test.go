@@ -166,7 +166,7 @@ func TestGrantViews(t *testing.T) {
 	r := g.RegisterView(0)
 
 	if r.addr != device+0x10 || r.Size() != FrameSize {
-		t.Errorf("registers at %#x, %d bytes; want %#x, %d bytes", r.addr, r.Size(), device+0x10, FrameSize)
+		t.Errorf("registers at %#x, %d bytes; want %#x, %d bytes", r.addr, r.Size(), uint64(device+0x10), FrameSize)
 	}
 
 	v, dev := g.DMA()
