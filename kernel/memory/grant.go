@@ -45,6 +45,7 @@ type Grant struct {
 
 	regs  []Range  // the registers, in whole pages
 	offs  []uint64 // the offset of each range of the DeviceMemory in its pages
+	sizes []uint64 // the size of each range of the DeviceMemory
 	views []uint64 // the address of each range of regs for the processor
 	held  bool     // the manager records regs as given
 
@@ -143,6 +144,7 @@ func (m *Manager) checkRegisters(g *Grant, regs []Range) error {
 
 		g.regs = append(g.regs, Range{Start: start, End: end})
 		g.offs = append(g.offs, r.Start-start)
+		g.sizes = append(g.sizes, r.End-r.Start)
 	}
 
 	return nil
@@ -192,7 +194,7 @@ func (g *Grant) givePart(size uint64) error {
 	}
 
 	// The device and the owner see the part only after the clearing.
-	clear(bytesAt(p.Start, p.End-p.Start))
+	clear(viewAt(p.Start, p.End-p.Start).b)
 	g.mapped = stepKernel
 
 	if g.domain != nil {
@@ -254,28 +256,43 @@ func (g *Grant) unmapView(virt, size uint64) error {
 	return nil
 }
 
-// Register returns the address for the processor of the owner of the first
-// byte of the register range i of the DeviceMemory.
+// Register returns the address for the processor of the owner of the
+// first byte of the register range i of the DeviceMemory. A process gets
+// this address from its kernel and makes its view itself; a driver in the
+// kernel uses RegisterView.
 func (g *Grant) Register(i int) uint64 {
 	return g.views[i] + g.offs[i]
 }
 
-// Part returns the DMA part: its address for the device, its address for
-// the processor of the owner, and its size in bytes, a multiple of
-// FrameSize. The size is 0 for a device without DMA.
+// RegisterView returns the register range i of the DeviceMemory, valid
+// until Release, for an owner that runs in the address space of the
+// kernel. The kernel maps it uncached and without execute.
+func (g *Grant) RegisterView(i int) RegisterView {
+	if g.window != nil {
+		panic("memory: the registers of an owner with its own address space are not mapped in the kernel")
+	}
+
+	return RegisterView{addr: uintptr(g.Register(i)), size: uintptr(g.sizes[i])}
+}
+
+// Part returns the addresses of the DMA part: for the device, for the
+// processor of the owner, and its size in bytes, a multiple of FrameSize.
+// The size is 0 for a device without DMA. A process gets these addresses
+// from its kernel; a driver in the kernel uses DMA.
 func (g *Grant) Part() (dev, virt, size uint64) {
 	return g.part.Start, g.partView, g.part.End - g.part.Start
 }
 
-// Bytes returns the memory of the DMA part for the kernel, which maps it
-// 1:1, or nil for a device without DMA. It is outside the Go heap: the
-// garbage collector never scans or moves it.
-func (g *Grant) Bytes() []byte {
+// DMA returns the DMA part as the kernel maps it, 1:1, and its address
+// for the device. The view is valid until Release and empty for a device
+// without DMA. The part is outside the Go heap: the garbage collector
+// never scans or moves it.
+func (g *Grant) DMA() (v View, dev uint64) {
 	if g.part.End == g.part.Start {
-		return nil
+		return View{}, 0
 	}
 
-	return bytesAt(g.part.Start, g.part.End-g.part.Start)
+	return viewAt(g.part.Start, g.part.End-g.part.Start), g.part.Start
 }
 
 func (g *Grant) String() string {
@@ -344,7 +361,7 @@ func (g *Grant) releasePart() error {
 	}
 
 	if g.mapped >= stepKernel {
-		clear(bytesAt(p.Start, size))
+		clear(viewAt(p.Start, size).b)
 
 		if err := unmap(g.m.space, p.Start, size, keep); err != nil {
 			return fmt.Errorf("memory: %s: unmap of the DMA part: %w", g.name, err)

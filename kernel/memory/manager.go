@@ -14,7 +14,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 // Config describes the memory of a Manager.
@@ -287,7 +286,7 @@ func (m *Manager) Alloc(o *Owner, size uint64) (*Region, error) {
 		r.mapped += FrameSize
 	}
 
-	clear(r.Bytes())
+	clear(r.View().Bytes())
 
 	if err := o.Hold(r); err != nil {
 		return nil, errors.Join(err, r.Release())
@@ -296,19 +295,15 @@ func (m *Manager) Alloc(o *Owner, size uint64) (*Region, error) {
 	return r, nil
 }
 
-// Addr returns the first address of the region.
-func (r *Region) Addr() uint64 {
-	return r.addr
-}
-
 // Size returns the size of the region in bytes, a multiple of FrameSize.
 func (r *Region) Size() uint64 {
 	return r.size
 }
 
-// Bytes returns the memory of the region. It is outside the Go heap.
-func (r *Region) Bytes() []byte {
-	return bytesAt(r.addr, r.size)
+// View returns the memory of the region, outside the Go heap. The view is
+// valid until Release.
+func (r *Region) View() View {
+	return viewAt(r.addr, r.size)
 }
 
 func (r *Region) String() string {
@@ -325,7 +320,7 @@ func (r *Region) Release() error {
 	defer r.owner.Drop(r)
 
 	if r.mapped != 0 {
-		clear(bytesAt(r.addr, r.mapped))
+		clear(viewAt(r.addr, r.mapped).b)
 
 		free := func(phys, size uint64) {
 			r.m.frames.Free(r.owner, phys, size/FrameSize)
@@ -344,13 +339,4 @@ func (r *Region) Release() error {
 // frameCount returns the number of frames that hold size bytes.
 func frameCount(size uint64) uint64 {
 	return alignUp(size, FrameSize) / FrameSize
-}
-
-// bytesAt returns the mapped memory of size bytes at addr. The address is
-// not a pointer of the Go runtime, so the pointer checks of the race
-// detector do not apply.
-//
-//go:nocheckptr
-func bytesAt(addr, size uint64) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(addr))), size)
 }

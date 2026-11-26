@@ -60,7 +60,7 @@ func TestGive(t *testing.T) {
 	dev, virt, size := g.Part()
 	region := tm.DMAFrames()
 
-	if size != 3*FrameSize || dev != virt || len(g.Bytes()) != int(size) {
+	if size != 3*FrameSize || dev != virt || g.dmaSize() != int(size) {
 		t.Fatalf("part %#x for the device, %#x for the processor, %d bytes", dev, virt, size)
 	}
 
@@ -74,7 +74,7 @@ func TestGive(t *testing.T) {
 		}
 	}
 
-	if !zero(g.Bytes()) {
+	if !zero(g.dmaBytes()) {
 		t.Error("new DMA part not cleared")
 	}
 
@@ -87,7 +87,7 @@ func TestGive(t *testing.T) {
 		t.Error("registers of another device: no error")
 	}
 
-	data := g.Bytes()
+	data := g.dmaBytes()
 	data[0], data[len(data)-1] = 0xab, 0xcd
 
 	if err := g.Release(); err != nil {
@@ -115,7 +115,7 @@ func TestGive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, size := g.Part(); size != 0 || g.Bytes() != nil {
+	if _, _, size := g.Part(); size != 0 || g.dmaBytes() != nil {
 		t.Errorf("device without DMA has a part of %d bytes", size)
 	}
 
@@ -412,4 +412,16 @@ func TestGiveDriverOfProcess(t *testing.T) {
 	}
 
 	tm.expectEmpty(t, driver)
+}
+
+// dmaBytes returns the DMA part of g for the kernel, or nil without one.
+func (g *Grant) dmaBytes() []byte {
+	v, _ := g.DMA()
+	return v.Bytes()
+}
+
+// dmaSize returns the size of the DMA part of g for the kernel.
+func (g *Grant) dmaSize() int {
+	v, _ := g.DMA()
+	return v.Size()
 }

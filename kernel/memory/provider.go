@@ -10,7 +10,6 @@ package memory
 
 import (
 	"errors"
-	"unsafe"
 )
 
 // ProviderConfig describes the memory that a Provider gives out.
@@ -240,7 +239,7 @@ func (p *Provider) Free() (free, largest uint64) {
 
 // clearMemory fills mapped memory with zeros.
 func clearMemory(virt, size uint64) {
-	clear(unsafe.Slice((*byte)(unsafe.Pointer(uintptr(virt))), size))
+	clear(viewAt(virt, size).b)
 }
 
 // fatal stops the program: the runtime called the provider with its locks

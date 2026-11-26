@@ -197,21 +197,21 @@ func TestAlloc(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r.Size() != 3*FrameSize || r.Addr() < tm.window.Start+FrameSize || r.Addr()+r.Size() > tm.window.End-FrameSize {
+	if r.Size() != 3*FrameSize || r.View().Addr() < tm.window.Start+FrameSize || r.View().Addr()+r.Size() > tm.window.End-FrameSize {
 		t.Fatalf("%v: want 3 pages between guard pages in the window %#x-%#x", r, tm.window.Start, tm.window.End)
 	}
 
-	if !zero(r.Bytes()) {
+	if !zero(r.View().Bytes()) {
 		t.Error("new region not cleared")
 	}
 
-	for _, guard := range []uint64{r.Addr() - FrameSize, r.Addr() + r.Size()} {
+	for _, guard := range []uint64{r.View().Addr() - FrameSize, r.View().Addr() + r.Size()} {
 		if _, _, ok := tm.space.Lookup(guard); ok {
 			t.Errorf("guard page %#x mapped", guard)
 		}
 	}
 
-	for virt := r.Addr(); virt < r.Addr()+r.Size(); virt += FrameSize {
+	for virt := r.View().Addr(); virt < r.View().Addr()+r.Size(); virt += FrameSize {
 		if phys, attr, ok := tm.space.Lookup(virt); !ok || attr != Data || phys < tm.memory.Start || phys >= tm.memory.End {
 			t.Errorf("%#x: got %#x, %#x, %v; want Data on a frame", virt, phys, attr, ok)
 		}
@@ -224,11 +224,11 @@ func TestAlloc(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r2.Addr() < r.Addr()+r.Size()+FrameSize && r.Addr() < r2.Addr()+r2.Size()+FrameSize {
+	if r2.View().Addr() < r.View().Addr()+r.Size()+FrameSize && r.View().Addr() < r2.View().Addr()+r2.Size()+FrameSize {
 		t.Errorf("%v and %v share a guard page", r, r2)
 	}
 
-	data := r.Bytes()
+	data := r.View().Bytes()
 	data[0] = 0xab
 
 	if err := r.Release(); err != nil {

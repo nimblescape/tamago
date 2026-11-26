@@ -11,7 +11,6 @@ package memory
 import (
 	"errors"
 	"sync/atomic"
-	"unsafe"
 )
 
 // TableEntries is the number of entries of a page table that fills one frame
@@ -220,14 +219,4 @@ func (t *Tables) Used() uint64 {
 	defer t.lock.unlock()
 
 	return t.used
-}
-
-// Table returns the entries of the table at addr. The address is a physical
-// address, which the kernel maps 1:1, not a pointer that the Go runtime
-// gave, so the pointer checks of the race detector do not apply.
-//
-//go:nocheckptr
-//go:nosplit
-func (t *Tables) Table(addr uint64) *[TableEntries]uint64 {
-	return (*[TableEntries]uint64)(unsafe.Pointer(uintptr(addr)))
 }
