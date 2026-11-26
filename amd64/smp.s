@@ -177,25 +177,14 @@ wait:
 	MOVQ	$0, task_gp(AX)
 	MOVQ	$0, task_pc(AX)
 
-	MOVQ	g, DI
-	CALL	·settls(SB)
-	MOVQ	g, (TLS)
-
 	// enable LAPIC
 	MOVL	$(const_LAPIC_SVR), AX
 	MOVL	$(1<<const_SVR_ENABLE), (AX)	// set SVR_ENABLE
 
-	// call task target
+	// call task target, which sets up its TLS block itself (see
+	// goos.Task)
 	STI
 	CALL	R12
 
 	// go back to idle state in case we return
 	JMP wait
-
-TEXT ·settls(SB),NOSPLIT,$0
-	ADDQ	$8, DI	// ELF wants to use -8(FS)
-	MOVQ	DI, AX
-	MOVQ	$MSR_FS_BASE, CX
-	MOVQ	$0x0, DX
-	WRMSR
-	RET
