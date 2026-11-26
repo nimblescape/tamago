@@ -66,6 +66,14 @@ func HeapView(n int) View {
 	return View{b: unsafe.Slice(p, n)}
 }
 
+// ViewOf returns a view of the Go slice b, with the bounds of b. It adds
+// no access, because b is already memory that the program may use. It is
+// for the boards that take their DMA memory from the TamaGo package dma,
+// until they have a memory manager.
+func ViewOf(b []byte) View {
+	return View{b: b[:len(b):len(b)]}
+}
+
 // Size returns the size of the view in bytes.
 func (v View) Size() int {
 	return len(v.b)

@@ -283,3 +283,16 @@ func BenchmarkLoad32(b *testing.B) {
 		sink = x
 	})
 }
+
+func TestViewOf(t *testing.T) {
+	b := make([]byte, 16, 32)
+	v := ViewOf(b)
+
+	if v.Size() != 16 || cap(v.Bytes()) != 16 || &v.Bytes()[0] != &b[0] {
+		t.Errorf("view of %d bytes, capacity %d", v.Size(), cap(v.Bytes()))
+	}
+
+	if ViewOf(nil).Size() != 0 {
+		t.Error("view of nil is not empty")
+	}
+}
