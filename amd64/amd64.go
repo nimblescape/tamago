@@ -80,6 +80,9 @@ type CPU struct {
 
 	// page table allocation state (see ConfigureMMU)
 	mmu mmu
+
+	// AP TLS blocks (see CPU.Task)
+	tls []*tlsBlock
 }
 
 // defined in amd64.s
@@ -119,6 +122,7 @@ func (cpu *CPU) Init() {
 	reg.Write64(taskAddress+0x00, 0)
 	reg.Write64(taskAddress+0x08, 0)
 	reg.Write64(taskAddress+0x10, 0)
+	reg.Write64(taskAddress+0x18, 0)
 }
 
 // Name returns the CPU identifier.

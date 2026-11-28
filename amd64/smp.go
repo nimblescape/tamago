@@ -44,10 +44,15 @@ func apinit_reloc(init uintptr, start uintptr)
 
 // task represents a CPU task
 type task struct {
-	sp uint64 // stack pointer
-	gp uint64 // G
-	pc uint64 // fn
+	sp  uint64 // stack pointer
+	gp  uint64 // G
+	pc  uint64 // fn
+	tls uint64 // TLS block
 }
+
+// tlsBlock represents the Thread Local Storage (TLS) block of an AP, the
+// runtime keeps the current G in its first word at -8(FS) (see ·settls).
+type tlsBlock [2]uint64
 
 // Write writes the task structure to memory
 func (t *task) Write(addr uint) {
@@ -73,10 +78,13 @@ func (t *task) Write(addr uint) {
 // On `GOOS=tamago` Go scheduler M's are never dropped, therefore the function
 // is invoked only once per AP (i.e. GOMAXPROCS-1).
 func (cpu *CPU) Task(sp, _, gp, fn unsafe.Pointer) {
+	tls := &tlsBlock{}
+
 	t := &task{
-		sp: uint64(uintptr(sp)),
-		gp: uint64(uintptr(gp)),
-		pc: uint64(uintptr(fn)),
+		sp:  uint64(uintptr(sp)),
+		gp:  uint64(uintptr(gp)),
+		pc:  uint64(uintptr(fn)),
+		tls: uint64(uintptr(unsafe.Pointer(tls))),
 	}
 
 	if t.sp == 0 || t.gp == 0 {
@@ -86,6 +94,9 @@ func (cpu *CPU) Task(sp, _, gp, fn unsafe.Pointer) {
 	if cpu.init+1 >= runtime.GOMAXPROCS(-1) {
 		panic("Task exceeds available resources")
 	}
+
+	// keep the TLS block referenced, the AP uses it for as long as it runs
+	cpu.tls = append(cpu.tls, tls)
 
 	t.Write(taskAddress)
 

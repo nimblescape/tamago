@@ -171,15 +171,17 @@ wait:
 
 	MOVQ	task_sp(AX), SP
 	MOVQ	task_gp(AX), g
+	MOVQ	task_tls(AX), DI
 
 	// clear task
 	MOVQ	$0, task_sp(AX)
 	MOVQ	$0, task_gp(AX)
 	MOVQ	$0, task_pc(AX)
+	MOVQ	$0, task_tls(AX)
 
-	MOVQ	g, DI
+	// store G in the TLS block of this AP, then point FS at it
+	MOVQ	g, (DI)
 	CALL	·settls(SB)
-	MOVQ	g, (TLS)
 
 	// enable LAPIC
 	MOVL	$(const_LAPIC_SVR), AX
